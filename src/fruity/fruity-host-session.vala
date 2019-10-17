@@ -449,29 +449,25 @@ namespace Frida {
 			if (server != null && server.flavor == REGULAR)
 				return yield server.session.enumerate_processes (cancellable);
 
-			try {
-				var device_info = yield Fruity.DeviceInfoService.open (channel_provider, cancellable);
+			var device_info = yield Fruity.DeviceInfoService.open (channel_provider, cancellable);
 
-				var processes = yield device_info.enumerate_running_processes (cancellable);
+			var processes = yield device_info.enumerate_running_processes (cancellable);
 
-				var no_icon = ImageData (0, 0, 0, "");
+			var no_icon = ImageData (0, 0, 0, "");
 
-				var result = new HostProcessInfo[processes.size];
-				int i = 0;
-				foreach (var process in processes) {
-					result[i] = HostProcessInfo (process.pid, process.name, no_icon, no_icon);
-					i++;
-				}
-
-				if (server != null && server.flavor == GADGET) {
-					foreach (var process in yield server.session.enumerate_processes (cancellable))
-						result += process;
-				}
-
-				return result;
-			} catch (Fruity.DTXError e) {
-				throw new Error.NOT_SUPPORTED ("%s", e.message);
+			var result = new HostProcessInfo[processes.size];
+			int i = 0;
+			foreach (var process in processes) {
+				result[i] = HostProcessInfo (process.pid, process.name, no_icon, no_icon);
+				i++;
 			}
+
+			if (server != null && server.flavor == GADGET) {
+				foreach (var process in yield server.session.enumerate_processes (cancellable))
+					result += process;
+			}
+
+			return result;
 		}
 
 		public async void enable_spawn_gating (Cancellable? cancellable) throws GLib.Error {
