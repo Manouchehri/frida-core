@@ -149,7 +149,7 @@ namespace Frida.Fruity {
 			return new DTXChannel ();
 		}
 
-		private void process_message (uint8[] raw_message) throws Error {
+		private void process_message (uint8[] raw_message, FragmentFlags fragment_flags) throws Error {
 			const size_t header_size = 16;
 
 			size_t message_size = raw_message.length;
@@ -175,11 +175,12 @@ namespace Frida.Fruity {
 			size_t payload_end_offset = payload_start_offset + (size_t) (data_size - aux_size);
 			unowned uint8[] payload_data = raw_message[payload_start_offset:payload_end_offset];
 
-			printerr ("[process_message] type=%s raw_message.length=%d aux_data.length=%d payload_data.length=%d\n",
+			printerr ("[process_message] type=%s raw_message.length=%d aux_data.length=%d payload_data.length=%d fragment_flags=%s\n",
 				type.to_string (),
 				raw_message.length,
 				aux_data.length,
-				payload_data.length);
+				payload_data.length,
+				fragment_flags.to_string ());
 		}
 
 		private async void process_incoming_fragments () {
@@ -188,7 +189,7 @@ namespace Frida.Fruity {
 					var fragment = yield read_fragment ();
 
 					if (fragment.count == 1) {
-						process_message (fragment.bytes.get_data ());
+						process_message (fragment.bytes.get_data (), (FragmentFlags) fragment.flags);
 						continue;
 					}
 
@@ -244,7 +245,7 @@ namespace Frida.Fruity {
 						fragments.unset (fragment.identifier);
 						total_buffered -= message.length;
 
-						process_message (message);
+						process_message (message, (FragmentFlags) first_fragment.flags);
 					}
 				} catch (GLib.Error e) {
 					printerr ("DERP: %s\n", e.message);
@@ -332,6 +333,11 @@ namespace Frida.Fruity {
 			public uint32 channel_code;
 			public uint32 flags;
 			public Bytes? bytes;
+		}
+
+		[Flags]
+		private enum FragmentFlags {
+			EXPECTS_REPLY = (1 << 0),
 		}
 	}
 
