@@ -158,6 +158,11 @@ namespace Frida.Fruity {
 				try {
 					var fragment = yield read_fragment ();
 
+					if (fragment.count == 1) {
+						dispatch_message (fragment.bytes.get_data ());
+						continue;
+					}
+
 					Gee.ArrayList<Fragment> entries = fragments[fragment.identifier];
 					if (entries == null) {
 						if (fragments.size == MAX_BUFFERED_COUNT)
