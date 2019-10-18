@@ -188,7 +188,7 @@ namespace Frida.Fruity {
 					throw new Error.PROTOCOL ("Malformed message payload");
 				printerr ("method_name: %s\n", method_name.str);
 
-				var args = PrimitiveDictionary.parse (aux_data);
+				var args = DTXArgumentList.parse (aux_data);
 			}
 		}
 
@@ -355,6 +355,91 @@ namespace Frida.Fruity {
 		}
 	}
 
+	private class DTXArgumentList {
+		private Value[] elements;
+
+		private DTXArgumentList (owned Value[] elements) {
+			this.elements = (owned) elements;
+		}
+
+		public static DTXArgumentList parse (uint8[] data) throws Error {
+			var elements = new Value[0];
+
+			var reader = new PrimitiveReader (data);
+
+			reader.skip (16);
+
+			while (reader.available_bytes != 0) {
+				PrimitiveType type;
+
+				type = (PrimitiveType) reader.read_uint32 ();
+				if (type != INDEX)
+					throw new Error.PROTOCOL ("Unsupported primitive dictionary");
+
+				type = (PrimitiveType) reader.read_uint32 ();
+				switch (type) {
+					case STRING: {
+						size_t size = reader.read_uint32 ();
+						string str = reader.read_string (size);
+
+						var gval = Value (typeof (string));
+						gval.take_string ((owned) str);
+						elements += (owned) gval;
+
+						break;
+					}
+					case BUFFER: {
+						size_t size = reader.read_uint32 ();
+						unowned uint8[] buf = reader.read_byte_array (size);
+
+						NSObject? obj = NSKeyedArchive.parse (buf);
+						if (obj != null) {
+							var gval = Value (Type.from_instance (obj));
+							gval.set_instance (obj);
+							elements += (owned) gval;
+						} else {
+							var gval = Value (typeof (NSObject));
+							elements += (owned) gval;
+						}
+
+						break;
+					}
+					case INT32: {
+						int32 val = reader.read_int32 ();
+
+						var gval = Value (typeof (int));
+						gval.set_int (val);
+						elements += (owned) gval;
+
+						break;
+					}
+					case INT64: {
+						int64 val = reader.read_int64 ();
+
+						var gval = Value (typeof (int64));
+						gval.set_int64 (val);
+						elements += (owned) gval;
+
+						break;
+					}
+					case DOUBLE: {
+						double val = reader.read_double ();
+
+						var gval = Value (typeof (double));
+						gval.set_double (val);
+						elements += (owned) gval;
+
+						break;
+					}
+					default:
+						throw new Error.PROTOCOL ("Unsupported primitive dictionary");
+				}
+			}
+
+			return new DTXArgumentList ((owned) elements);
+		}
+	}
+
 	private class NSObject {
 	}
 
@@ -367,60 +452,136 @@ namespace Frida.Fruity {
 		public NSString (string str) {
 			this.str = str;
 		}
+
+		public static uint hash (NSString val) {
+			return str_hash (val.str);
+		}
+
+		public bool equal (NSString a, NSString b) {
+			return str_equal (a.str, b.str);
+		}
+	}
+
+	private class NSDictionary : NSObject {
+		public int size {
+			get {
+				return storage.size;
+			}
+		}
+
+		public Gee.Iterable<NSObject> keys {
+			owned get {
+				return storage.keys;
+			}
+		}
+
+		public Gee.Iterable<NSObject> values {
+			owned get {
+				return storage.values;
+			}
+		}
+
+		private Gee.HashMap<NSObject, NSObject> storage;
+
+		public NSDictionary (Gee.HashMap<NSObject, NSObject> storage) {
+			this.storage = storage;
+		}
 	}
 
 	namespace NSKeyedArchive {
+		private Gee.HashMap<string, DecodeFunc> decoders;
+
+		[CCode (has_target = false)]
+		private delegate NSObject DecodeFunc (PlistDict instance, PlistArray objects) throws Error, PlistError;
+
 		private static NSObject? parse (uint8[] data) throws Error {
+			ensure_decoders_registered ();
+
 			try {
 				var plist = new Plist.from_binary (data);
 
-				return decode_value (plist.get_dict ("$top").get_uid ("root").uid, plist.get_array ("$objects"));
+				printerr ("parse: %s\n", plist.to_xml ());
+				FileUtils.set_data ("/Users/oleavr/VMShared/nskeyedarchive.plist", data);
+
+				return decode_value (plist.get_dict ("$top").get_uid ("root"), plist.get_array ("$objects"));
 			} catch (PlistError e) {
 				throw new Error.PROTOCOL ("%s", e.message);
 			}
 		}
 
-		private static NSObject? decode_value (uint64 uid, PlistArray objects) throws Error, PlistError {
+		private static NSObject? decode_value (PlistUid index, PlistArray objects) throws Error, PlistError {
+			var uid = index.uid;
 			if (uid == 0)
 				return null;
 
 			Value val = objects.get_value ((int) uid);
 			Type t = val.type ();
+
 			if (t == typeof (string))
 				return new NSString (val.get_string ());
 
-			throw new Error.PROTOCOL ("Unsupported NSKeyedArchive type: %s", val.type_name ());
-		}
-	}
-
-	private class PrimitiveDictionary {
-		public static PrimitiveDictionary parse (uint8[] data) throws Error {
-			var reader = new PrimitiveReader (data);
-
-			reader.skip (16);
-
-			while (reader.available_bytes != 0) {
-				PrimitiveType type = (PrimitiveType) reader.read_uint32 ();
-				printerr ("%s\n", type.to_string ());
-				switch (type) {
-					case STRING:
-						break;
-					case BUFFER:
-						break;
-					case INT32:
-						break;
-					case INT64:
-						break;
-					case DOUBLE:
-						break;
-					case INDEX:
-						break;
-					default:
-						throw new Error.PROTOCOL ("Unsupported primitive dictionary");
-				}
+			if (t == typeof (PlistDict)) {
+				var instance = val.get_object () as PlistDict;
+				var klass = objects.get_dict ((int) instance.get_uid ("$class").uid);
+				var decode = get_decoder (klass);
+				return decode (instance, objects);
 			}
 
-			return new PrimitiveDictionary ();
+			throw new Error.PROTOCOL ("Unsupported NSKeyedArchive type: %s", val.type_name ());
+		}
+
+		private static DecodeFunc get_decoder (PlistDict klass) throws Error, PlistError {
+			var hierarchy = klass.get_array ("$classes");
+
+			int n = hierarchy.length;
+			for (int i = 0; i != n; i++) {
+				var name = hierarchy.get_string (i);
+				var decoder = decoders[name];
+				if (decoder != null)
+					return decoder;
+			}
+
+			throw new Error.PROTOCOL ("No decoder for NSKeyedArchive type “%s”", klass.get_string ("$classname"));
+		}
+
+		private static void ensure_decoders_registered () {
+			if (decoders != null)
+				return;
+
+			decoders = new Gee.HashMap<string, DecodeFunc> ();
+			decoders["NSDictionary"] = decode_dictionary;
+		}
+
+		private static NSObject decode_dictionary (PlistDict instance, PlistArray objects) throws Error, PlistError {
+			var keys = instance.get_array ("NS.keys");
+			var objs = instance.get_array ("NS.objects");
+
+			Gee.HashMap<NSObject, NSObject> storage = null;
+
+			var n = keys.length;
+			for (int i = 0; i != n; i++) {
+				var key = decode_value (keys.get_uid (i), objects);
+				var obj = decode_value (objs.get_uid (i), objects);
+
+				if (storage == null) {
+					Gee.HashDataFunc<NSObject> key_hash = null;
+					Gee.EqualDataFunc<NSObject> key_equal = null;
+
+					if (key is NSString) {
+						key_hash = (Gee.HashDataFunc<NSObject>) NSString.hash;
+						key_equal = (Gee.EqualDataFunc<NSObject>) NSString.equal;
+					}
+
+					storage = new Gee.HashMap<NSObject, NSObject> ((owned) key_hash, (owned) key_equal);
+				}
+
+				storage[key] = obj;
+			}
+
+			if (storage == null)
+				storage = new Gee.HashMap<NSObject, NSObject> ();
+
+			return new NSDictionary (storage);
 		}
 	}
 
@@ -493,6 +654,16 @@ namespace Frida.Fruity {
 			check_available (n);
 
 			return ((uint8[]) cursor)[0:n];
+		}
+
+		public string read_string (size_t size) throws Error {
+			check_available (size);
+
+			unowned string data = (string) cursor;
+			string str = data.substring (0, (long) size);
+			cursor += size;
+
+			return str;
 		}
 
 		private void check_available (size_t n) throws Error {
