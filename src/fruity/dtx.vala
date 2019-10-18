@@ -76,7 +76,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	public class DTXConnection : Object {
+	private class DTXConnection : Object {
 		public IOStream stream {
 			get;
 			construct;
@@ -91,11 +91,16 @@ namespace Frida.Fruity {
 		private Gee.HashMap<uint32, Gee.ArrayList<Fragment>> fragments = new Gee.HashMap<uint32, Gee.ArrayList<Fragment>> ();
 		private size_t total_buffered = 0;
 
+		private Gee.HashMap<uint32, DTXChannel> channels = new Gee.HashMap<uint32, DTXChannel> ();
+		private int32 next_channel_code = 1;
+
 		private const uint32 DTX_FRAGMENT_MAGIC = 0x1f3d5b79U;
 		private const uint MAX_BUFFERED_COUNT = 100;
 		private const size_t MAX_BUFFERED_SIZE = 30 * 1024 * 1024;
 		private const size_t MAX_MESSAGE_SIZE = 1024 * 1024;
 		private const size_t MAX_FRAGMENT_SIZE = 128 * 1024;
+
+		private const int32 CONTROL_CHANNEL_CODE = 0;
 
 		public static async DTXConnection obtain (ChannelProvider channel_provider, Cancellable? cancellable)
 				throws Error, IOError {
@@ -142,11 +147,35 @@ namespace Frida.Fruity {
 			input.byte_order = LITTLE_ENDIAN;
 			output = stream.get_output_stream ();
 
+			var control_channel = new DTXChannel (CONTROL_CHANNEL_CODE);
+			channels[CONTROL_CHANNEL_CODE] = control_channel;
+
 			process_incoming_fragments.begin ();
 		}
 
 		public DTXChannel make_channel (string identifier) {
-			return new DTXChannel ();
+			int32 channel_code = next_channel_code++;
+
+			var channel = new DTXChannel (channel_code);
+			channels[channel_code] = channel;
+
+			request_channel.begin (channel, identifier);
+
+			return channel;
+		}
+
+		private async void request_channel (DTXChannel channel, string identifier) {
+			var control_channel = channels[CONTROL_CHANNEL_CODE];
+
+			var args = new DTXArgumentListBuilder ()
+				.append_int32 (channel.code)
+				.append_string (identifier)
+				.build ();
+			try {
+				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
+			} catch (GLib.Error e) {
+				channels.unset (channel.code);
+			}
 		}
 
 		private void process_message (uint8[] raw_message, FragmentFlags fragment_flags) throws Error {
@@ -286,7 +315,7 @@ namespace Frida.Fruity {
 				fragment.data_size = input.read_uint32 (io_cancellable);
 				fragment.identifier = input.read_uint32 (io_cancellable);
 				fragment.conversation_index = input.read_uint32 (io_cancellable);
-				fragment.channel_code = input.read_uint32 (io_cancellable);
+				fragment.channel_code = input.read_int32 (io_cancellable);
 				fragment.flags = input.read_uint32 (io_cancellable);
 
 				size_t extra_header_size = header_size - minimum_header_size;
@@ -339,7 +368,7 @@ namespace Frida.Fruity {
 			public uint32 data_size;
 			public uint32 identifier;
 			public uint32 conversation_index;
-			public uint32 channel_code;
+			public int32 channel_code;
 			public uint32 flags;
 			public Bytes? bytes;
 		}
@@ -350,8 +379,21 @@ namespace Frida.Fruity {
 		}
 	}
 
-	public class DTXChannel : Object {
+	private class DTXChannel : Object {
+		public int32 code {
+			get;
+			construct;
+		}
+
+		public DTXChannel (int32 code) {
+			Object (code: code);
+		}
+
 		public async void close (Cancellable? cancellable = null) throws IOError {
+		}
+
+		public async NSObject? invoke (string method_name, Bytes args, Cancellable? cancellable) throws Error, IOError {
+			return null;
 		}
 	}
 
@@ -367,23 +409,23 @@ namespace Frida.Fruity {
 
 			var reader = new PrimitiveReader (data);
 
-			reader.skip (16);
+			reader.skip (PRIMITIVE_DICTIONARY_HEADER_SIZE);
 
 			while (reader.available_bytes != 0) {
 				PrimitiveType type;
 
 				type = (PrimitiveType) reader.read_uint32 ();
 				if (type != INDEX)
-					throw new Error.PROTOCOL ("Unsupported primitive dictionary");
+					throw new Error.PROTOCOL ("Unsupported primitive dictionary key type");
 
 				type = (PrimitiveType) reader.read_uint32 ();
 				switch (type) {
 					case STRING: {
 						size_t size = reader.read_uint32 ();
-						string str = reader.read_string (size);
+						string val = reader.read_string (size);
 
 						var gval = Value (typeof (string));
-						gval.take_string ((owned) str);
+						gval.take_string ((owned) val);
 						elements += (owned) gval;
 
 						break;
@@ -432,7 +474,7 @@ namespace Frida.Fruity {
 						break;
 					}
 					default:
-						throw new Error.PROTOCOL ("Unsupported primitive dictionary");
+						throw new Error.PROTOCOL ("Unsupported primitive dictionary value type");
 				}
 			}
 
@@ -440,7 +482,70 @@ namespace Frida.Fruity {
 		}
 	}
 
+	private class DTXArgumentListBuilder {
+		private PrimitiveBuilder blob = new PrimitiveBuilder ();
+
+		public DTXArgumentListBuilder () {
+			blob.seek (PRIMITIVE_DICTIONARY_HEADER_SIZE);
+		}
+
+		public unowned DTXArgumentListBuilder append_string (string str) {
+			begin_entry (STRING)
+				.append_string (str);
+			return this;
+		}
+
+		public unowned DTXArgumentListBuilder append_object (NSObject? obj) {
+			begin_entry (BUFFER)
+				.append_byte_array (NSKeyedArchive.unparse (obj));
+			return this;
+		}
+
+		public unowned DTXArgumentListBuilder append_int32 (int32 val) {
+			begin_entry (INT32)
+				.append_int32 (val);
+			return this;
+		}
+
+		public unowned DTXArgumentListBuilder append_int64 (int64 val) {
+			begin_entry (INT64)
+				.append_int64 (val);
+			return this;
+		}
+
+		public unowned DTXArgumentListBuilder append_double (double val) {
+			begin_entry (DOUBLE)
+				.append_double (val);
+			return this;
+		}
+
+		private unowned PrimitiveBuilder begin_entry (PrimitiveType type) {
+			return blob
+				.append_uint32 (PrimitiveType.INDEX)
+				.append_uint32 (type);
+		}
+
+		public Bytes build () {
+			size_t size = blob.offset - PRIMITIVE_DICTIONARY_HEADER_SIZE;
+			return blob.seek (0)
+				.append_uint64 (size)
+				.append_uint64 (size)
+				.build ();
+		}
+	}
+
 	private class NSObject {
+	}
+
+	private class NSNumber : NSObject {
+		public int64 val {
+			get;
+			private set;
+		}
+
+		public NSNumber (int64 val) {
+			this.val = val;
+		}
 	}
 
 	private class NSString : NSObject {
@@ -500,13 +605,19 @@ namespace Frida.Fruity {
 			try {
 				var plist = new Plist.from_binary (data);
 
+				/*
 				printerr ("parse: %s\n", plist.to_xml ());
 				FileUtils.set_data ("/Users/oleavr/VMShared/nskeyedarchive.plist", data);
+				*/
 
 				return decode_value (plist.get_dict ("$top").get_uid ("root"), plist.get_array ("$objects"));
 			} catch (PlistError e) {
 				throw new Error.PROTOCOL ("%s", e.message);
 			}
+		}
+
+		private static uint8[] unparse (NSObject? obj) {
+			return new uint8[0];
 		}
 
 		private static NSObject? decode_value (PlistUid index, PlistArray objects) throws Error, PlistError {
@@ -516,6 +627,9 @@ namespace Frida.Fruity {
 
 			Value val = objects.get_value ((int) uid);
 			Type t = val.type ();
+
+			if (t == typeof (int64))
+				return new NSNumber (val.get_int64 ());
 
 			if (t == typeof (string))
 				return new NSString (val.get_string ());
@@ -594,6 +708,8 @@ namespace Frida.Fruity {
 		INDEX = 10
 	}
 
+	private const size_t PRIMITIVE_DICTIONARY_HEADER_SIZE = 16;
+
 	private class PrimitiveReader {
 		public size_t available_bytes {
 			get {
@@ -644,16 +760,28 @@ namespace Frida.Fruity {
 			return val;
 		}
 
+		public uint64 read_uint64 () throws Error {
+			const size_t n = sizeof (uint64);
+			check_available (n);
+
+			uint64 val = uint64.from_little_endian (*((uint64 *) cursor));
+			cursor += n;
+
+			return val;
+		}
+
 		public double read_double () throws Error {
-			int64 val = read_int64 ();
-			double * d = (double *) &val;
-			return *d;
+			uint64 bits = read_uint64 ();
+			return *((double *) &bits);
 		}
 
 		public unowned uint8[] read_byte_array (size_t n) throws Error {
 			check_available (n);
 
-			return ((uint8[]) cursor)[0:n];
+			unowned uint8[] arr = ((uint8[]) cursor)[0:n];
+			cursor += n;
+
+			return arr;
 		}
 
 		public string read_string (size_t size) throws Error {
@@ -669,6 +797,83 @@ namespace Frida.Fruity {
 		private void check_available (size_t n) throws Error {
 			if (cursor + n > end)
 				throw new Error.PROTOCOL ("Invalid dictionary");
+		}
+	}
+
+	private class PrimitiveBuilder {
+		public size_t offset {
+			get {
+				return cursor;
+			}
+		}
+
+		private ByteArray buffer = new ByteArray.sized (64);
+		private size_t cursor = 0;
+
+		public unowned PrimitiveBuilder seek (size_t offset) {
+			if (buffer.len < offset) {
+				size_t n = offset - buffer.len;
+				Memory.set (get_pointer (offset - n, n), 0, n);
+			}
+			cursor = offset;
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_int32 (int32 val) {
+			*((int32 *) get_pointer (cursor, sizeof (int32))) = val.to_little_endian ();
+			cursor += (uint) sizeof (int32);
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_uint32 (uint32 val) {
+			*((uint32 *) get_pointer (cursor, sizeof (uint32))) = val.to_little_endian ();
+			cursor += (uint) sizeof (uint32);
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_int64 (int64 val) {
+			*((int64 *) get_pointer (cursor, sizeof (int64))) = val.to_little_endian ();
+			cursor += (uint) sizeof (int64);
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_uint64 (uint64 val) {
+			*((uint64 *) get_pointer (cursor, sizeof (uint64))) = val.to_little_endian ();
+			cursor += (uint) sizeof (uint64);
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_double (double val) {
+			uint64 raw_val = *((uint64 *) &val);
+			*((uint64 *) get_pointer (cursor, sizeof (uint64))) = raw_val.to_little_endian ();
+			cursor += (uint) sizeof (uint64);
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_byte_array (uint8[] array) {
+			uint size = array.length;
+			Memory.copy (get_pointer (cursor, size), array, size);
+			cursor += size;
+			return this;
+		}
+
+		public unowned PrimitiveBuilder append_string (string str) {
+			uint size = str.length;
+			Memory.copy (get_pointer (cursor, size), str, size);
+			cursor += size;
+			return this;
+		}
+
+		private uint8 * get_pointer (size_t offset, size_t n) {
+			size_t minimum_size = offset + n;
+			if (buffer.len < minimum_size)
+				buffer.set_size ((uint) minimum_size);
+
+			return (uint8 *) buffer.data + offset;
+		}
+
+		public Bytes build () {
+			return ByteArray.free_to_bytes ((owned) buffer);
 		}
 	}
 }
