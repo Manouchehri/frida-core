@@ -181,6 +181,13 @@ namespace Frida.Fruity {
 				aux_data.length,
 				payload_data.length,
 				fragment_flags.to_string ());
+
+			if (type == INVOKE) {
+				NSString? method_name = NSKeyedArchive.parse (payload_data) as NSString;
+				if (method_name == null)
+					throw new Error.PROTOCOL ("Malformed message payload");
+				printerr ("method_name: %s\n", method_name.str);
+			}
 		}
 
 		private async void process_incoming_fragments () {
@@ -343,6 +350,44 @@ namespace Frida.Fruity {
 
 	public class DTXChannel : Object {
 		public async void close (Cancellable? cancellable = null) throws IOError {
+		}
+	}
+
+	private class NSObject {
+	}
+
+	private class NSString : NSObject {
+		public string str {
+			get;
+			private set;
+		}
+
+		public NSString (string str) {
+			this.str = str;
+		}
+	}
+
+	namespace NSKeyedArchive {
+		private static NSObject? parse (uint8[] data) throws Error {
+			try {
+				var plist = new Plist.from_binary (data);
+
+				return decode_value (plist.get_dict ("$top").get_uid ("root").uid, plist.get_array ("$objects"));
+			} catch (PlistError e) {
+				throw new Error.PROTOCOL ("%s", e.message);
+			}
+		}
+
+		private static NSObject? decode_value (uint64 uid, PlistArray objects) throws Error, PlistError {
+			if (uid == 0)
+				return null;
+
+			Value val = objects.get_value ((int) uid);
+			Type t = val.type ();
+			if (t == typeof (string))
+				return new NSString (val.get_string ());
+
+			throw new Error.PROTOCOL ("Unsupported NSKeyedArchive type: %s", val.type_name ());
 		}
 	}
 }
