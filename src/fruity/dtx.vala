@@ -88,7 +88,14 @@ namespace Frida.Fruity {
 		private OutputStream output;
 		private Cancellable io_cancellable = new Cancellable ();
 
-		private const uint32 DTX_MESSAGE_MAGIC = 0x1f3d5b79U;
+		private Gee.HashMap<uint32, Gee.ArrayList<Fragment>> fragments = new Gee.HashMap<uint32, Gee.ArrayList<Fragment>> ();
+		private size_t total_buffered = 0;
+
+		private const uint32 DTX_FRAGMENT_MAGIC = 0x1f3d5b79U;
+		private const uint MAX_BUFFERED_COUNT = 100;
+		private const size_t MAX_BUFFERED_SIZE = 30 * 1024 * 1024;
+		private const size_t MAX_MESSAGE_SIZE = 1024 * 1024;
+		private const size_t MAX_FRAGMENT_SIZE = 128 * 1024;
 
 		public static async DTXConnection obtain (ChannelProvider channel_provider, Cancellable? cancellable)
 				throws Error, IOError {
@@ -142,11 +149,70 @@ namespace Frida.Fruity {
 			return new DTXChannel ();
 		}
 
+		private void dispatch_message (uint8[] data) {
+			printerr ("FIXME: dispatch message, data.length=%d\n", data.length);
+		}
+
 		private async void process_incoming_fragments () {
 			while (true) {
 				try {
 					var fragment = yield read_fragment ();
 
+					Gee.ArrayList<Fragment> entries = fragments[fragment.identifier];
+					if (entries == null) {
+						if (fragments.size == MAX_BUFFERED_COUNT)
+							throw new Error.PROTOCOL ("Total buffered count exceeds maximum");
+
+						if (fragment.index != 0)
+							throw new Error.PROTOCOL ("Expected first fragment to have index of zero");
+						fragment.data_size = 0;
+
+						entries = new Gee.ArrayList<Fragment> ();
+						fragments[fragment.identifier] = entries;
+					}
+					entries.add (fragment);
+
+					var first_fragment = entries[0];
+
+					if (fragment.bytes != null) {
+						var size = fragment.bytes.get_size ();
+
+						first_fragment.data_size += (uint32) size;
+						if (first_fragment.data_size > MAX_MESSAGE_SIZE)
+							throw new Error.PROTOCOL ("Message size exceeds maximum");
+
+						total_buffered += size;
+						if (total_buffered > MAX_BUFFERED_SIZE)
+							throw new Error.PROTOCOL ("Total buffered size exceeds maximum");
+					}
+
+					if (entries.size == fragment.count) {
+						var message = new uint8[first_fragment.data_size];
+
+						var sorted_entries = entries.order_by ((a, b) => (int) a.index - (int) b.index);
+						uint i = 0;
+						size_t offset = 0;
+						while (sorted_entries.next ()) {
+							Fragment f = sorted_entries.get ();
+
+							if (f.index != i)
+								throw new Error.PROTOCOL ("Inconsistent fragments received");
+
+							var bytes = f.bytes;
+							if (bytes != null) {
+								var size = bytes.get_size ();
+								Memory.copy ((uint8 *) message + offset, (uint8 *) bytes.get_data (), size);
+								offset += size;
+							}
+
+							i++;
+						}
+
+						fragments.unset (fragment.identifier);
+						total_buffered -= message.length;
+
+						dispatch_message (message);
+					}
 				} catch (GLib.Error e) {
 					printerr ("DERP: %s\n", e.message);
 					return;
@@ -158,12 +224,12 @@ namespace Frida.Fruity {
 			var io_priority = Priority.DEFAULT;
 
 			try {
-				ssize_t minimum_header_size = 32;
+				size_t minimum_header_size = 32;
 
-				yield input.fill_async (minimum_header_size, io_priority, io_cancellable);
+				yield prepare_to_read (minimum_header_size);
 
 				uint32 magic = input.read_uint32 (io_cancellable);
-				if (magic != DTX_MESSAGE_MAGIC)
+				if (magic != DTX_FRAGMENT_MAGIC)
 					throw new Error.PROTOCOL ("Expected DTX message magic, got 0x%08x", magic);
 
 				var fragment = new Fragment ();
@@ -171,7 +237,6 @@ namespace Frida.Fruity {
 				var header_size = input.read_uint32 (io_cancellable);
 				if (header_size < minimum_header_size)
 					throw new Error.PROTOCOL ("Expected header size of >= 32, got %u", header_size);
-				printerr ("header_size=%u\n", header_size);
 
 				fragment.index = input.read_uint16 (io_cancellable);
 				fragment.count = input.read_uint16 (io_cancellable);
@@ -181,16 +246,39 @@ namespace Frida.Fruity {
 				fragment.channel_code = input.read_uint32 (io_cancellable);
 				fragment.flags = input.read_uint32 (io_cancellable);
 
-				ssize_t extra_header_size = header_size - minimum_header_size;
+				size_t extra_header_size = header_size - minimum_header_size;
 				if (extra_header_size > 0)
 					yield input.skip_async (extra_header_size, io_priority, io_cancellable);
 
+				if (fragment.count == 1 || fragment.index != 0) {
+					if (fragment.data_size == 0)
+						throw new Error.PROTOCOL ("Empty fragments are not allowed");
+					if (fragment.data_size > MAX_FRAGMENT_SIZE)
+						throw new Error.PROTOCOL ("Fragment size exceeds maximum");
+
+					if (fragment.data_size > input.get_buffer_size ())
+						input.set_buffer_size (fragment.data_size);
+
+					yield prepare_to_read (fragment.data_size);
+					fragment.bytes = input.read_bytes (fragment.data_size, io_cancellable);
+				}
 
 				return fragment;
 			} catch (GLib.Error e) {
 				if (e is Error)
 					throw (Error) e;
 				throw new Error.TRANSPORT ("%s", e.message);
+			}
+		}
+
+		private async void prepare_to_read (size_t required) throws GLib.Error {
+			while (true) {
+				size_t available = input.get_available ();
+				if (available >= required)
+					return;
+				ssize_t n = yield input.fill_async ((ssize_t) (required - available), Priority.DEFAULT, io_cancellable);
+				if (n == 0)
+					throw new Error.TRANSPORT ("Connection closed");
 			}
 		}
 
@@ -202,6 +290,7 @@ namespace Frida.Fruity {
 			public uint32 conversation_index;
 			public uint32 channel_code;
 			public uint32 flags;
+			public Bytes? bytes;
 		}
 	}
 
