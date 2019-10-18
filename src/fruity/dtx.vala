@@ -149,8 +149,37 @@ namespace Frida.Fruity {
 			return new DTXChannel ();
 		}
 
-		private void dispatch_message (uint8[] data) {
-			printerr ("FIXME: dispatch message, data.length=%d\n", data.length);
+		private void process_message (uint8[] raw_message) throws Error {
+			const size_t header_size = 16;
+
+			size_t message_size = raw_message.length;
+			if (message_size < header_size)
+				throw new Error.PROTOCOL ("Malformed message");
+
+			uint8 * m = (uint8 *) raw_message;
+
+			MessageType type = (MessageType) *m;
+
+			uint32 aux_size = uint32.from_little_endian (*((uint32 *) (m + 4)));
+			uint64 data_size = uint64.from_little_endian (*((uint64 *) (m + 8)));
+			if (aux_size > message_size || data_size > message_size || data_size != message_size - header_size ||
+					aux_size > data_size) {
+				throw new Error.PROTOCOL ("Malformed message");
+			}
+
+			size_t aux_start_offset = header_size;
+			size_t aux_end_offset = aux_start_offset + aux_size;
+			unowned uint8[] aux_data = raw_message[aux_start_offset:aux_end_offset];
+
+			size_t payload_start_offset = aux_end_offset;
+			size_t payload_end_offset = payload_start_offset + (size_t) (data_size - aux_size);
+			unowned uint8[] payload_data = raw_message[payload_start_offset:payload_end_offset];
+
+			printerr ("[process_message] type=%s raw_message.length=%d aux_data.length=%d payload_data.length=%d\n",
+				type.to_string (),
+				raw_message.length,
+				aux_data.length,
+				payload_data.length);
 		}
 
 		private async void process_incoming_fragments () {
@@ -159,7 +188,7 @@ namespace Frida.Fruity {
 					var fragment = yield read_fragment ();
 
 					if (fragment.count == 1) {
-						dispatch_message (fragment.bytes.get_data ());
+						process_message (fragment.bytes.get_data ());
 						continue;
 					}
 
@@ -167,7 +196,6 @@ namespace Frida.Fruity {
 					if (entries == null) {
 						if (fragments.size == MAX_BUFFERED_COUNT)
 							throw new Error.PROTOCOL ("Total buffered count exceeds maximum");
-
 						if (fragment.index != 0)
 							throw new Error.PROTOCOL ("Expected first fragment to have index of zero");
 						fragment.data_size = 0;
@@ -216,7 +244,7 @@ namespace Frida.Fruity {
 						fragments.unset (fragment.identifier);
 						total_buffered -= message.length;
 
-						dispatch_message (message);
+						process_message (message);
 					}
 				} catch (GLib.Error e) {
 					printerr ("DERP: %s\n", e.message);
@@ -285,6 +313,14 @@ namespace Frida.Fruity {
 				if (n == 0)
 					throw new Error.TRANSPORT ("Connection closed");
 			}
+		}
+
+		private enum MessageType {
+			OK = 0,
+			INVOKE = 2,
+			RESULT = 3,
+			ERROR = 4,
+			BARRIER = 5
 		}
 
 		private class Fragment {
