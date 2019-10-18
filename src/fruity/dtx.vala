@@ -187,6 +187,8 @@ namespace Frida.Fruity {
 				if (method_name == null)
 					throw new Error.PROTOCOL ("Malformed message payload");
 				printerr ("method_name: %s\n", method_name.str);
+
+				var args = PrimitiveDictionary.parse (aux_data);
 			}
 		}
 
@@ -388,6 +390,114 @@ namespace Frida.Fruity {
 				return new NSString (val.get_string ());
 
 			throw new Error.PROTOCOL ("Unsupported NSKeyedArchive type: %s", val.type_name ());
+		}
+	}
+
+	private class PrimitiveDictionary {
+		public static PrimitiveDictionary parse (uint8[] data) throws Error {
+			var reader = new PrimitiveReader (data);
+
+			reader.skip (16);
+
+			while (reader.available_bytes != 0) {
+				PrimitiveType type = (PrimitiveType) reader.read_uint32 ();
+				printerr ("%s\n", type.to_string ());
+				switch (type) {
+					case STRING:
+						break;
+					case BUFFER:
+						break;
+					case INT32:
+						break;
+					case INT64:
+						break;
+					case DOUBLE:
+						break;
+					case INDEX:
+						break;
+					default:
+						throw new Error.PROTOCOL ("Unsupported primitive dictionary");
+				}
+			}
+
+			return new PrimitiveDictionary ();
+		}
+	}
+
+	private enum PrimitiveType {
+		STRING = 1,
+		BUFFER = 2,
+		INT32 = 3,
+		INT64 = 6,
+		DOUBLE = 9,
+		INDEX = 10
+	}
+
+	private class PrimitiveReader {
+		public size_t available_bytes {
+			get {
+				return end - cursor;
+			}
+		}
+
+		private uint8 * cursor;
+		private uint8 * end;
+
+		public PrimitiveReader (uint8[] data) {
+			cursor = (uint8 *) data;
+			end = cursor + data.length;
+		}
+
+		public void skip (size_t n) throws Error {
+			check_available (n);
+			cursor += n;
+		}
+
+		public int32 read_int32 () throws Error {
+			const size_t n = sizeof (int32);
+			check_available (n);
+
+			int32 val = int32.from_little_endian (*((int32 *) cursor));
+			cursor += n;
+
+			return val;
+		}
+
+		public uint32 read_uint32 () throws Error {
+			const size_t n = sizeof (uint32);
+			check_available (n);
+
+			uint32 val = uint32.from_little_endian (*((uint32 *) cursor));
+			cursor += n;
+
+			return val;
+		}
+
+		public int64 read_int64 () throws Error {
+			const size_t n = sizeof (int64);
+			check_available (n);
+
+			int64 val = int64.from_little_endian (*((int64 *) cursor));
+			cursor += n;
+
+			return val;
+		}
+
+		public double read_double () throws Error {
+			int64 val = read_int64 ();
+			double * d = (double *) &val;
+			return *d;
+		}
+
+		public unowned uint8[] read_byte_array (size_t n) throws Error {
+			check_available (n);
+
+			return ((uint8[]) cursor)[0:n];
+		}
+
+		private void check_available (size_t n) throws Error {
+			if (cursor + n > end)
+				throw new Error.PROTOCOL ("Invalid dictionary");
 		}
 	}
 }
