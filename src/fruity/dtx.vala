@@ -76,7 +76,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class DTXConnection : Object {
+	private class DTXConnection : Object, DTXTransport {
 		public IOStream stream {
 			get;
 			construct;
@@ -89,7 +89,9 @@ namespace Frida.Fruity {
 		private Cancellable io_cancellable = new Cancellable ();
 
 		private Gee.HashMap<uint32, Gee.ArrayList<Fragment>> fragments = new Gee.HashMap<uint32, Gee.ArrayList<Fragment>> ();
+		private uint32 next_fragment_identifier = 1;
 		private size_t total_buffered = 0;
+		private Gee.ArrayQueue<Bytes> pending_writes = new Gee.ArrayQueue<Bytes> ();
 
 		private Gee.HashMap<uint32, DTXChannel> channels = new Gee.HashMap<uint32, DTXChannel> ();
 		private int32 next_channel_code = 1;
@@ -147,7 +149,7 @@ namespace Frida.Fruity {
 			input.byte_order = LITTLE_ENDIAN;
 			output = stream.get_output_stream ();
 
-			var control_channel = new DTXChannel (CONTROL_CHANNEL_CODE);
+			var control_channel = new DTXChannel (CONTROL_CHANNEL_CODE, this);
 			channels[CONTROL_CHANNEL_CODE] = control_channel;
 
 			process_incoming_fragments.begin ();
@@ -156,7 +158,7 @@ namespace Frida.Fruity {
 		public DTXChannel make_channel (string identifier) {
 			int32 channel_code = next_channel_code++;
 
-			var channel = new DTXChannel (channel_code);
+			var channel = new DTXChannel (channel_code, this);
 			channels[channel_code] = channel;
 
 			request_channel.begin (channel, identifier);
@@ -169,55 +171,11 @@ namespace Frida.Fruity {
 
 			var args = new DTXArgumentListBuilder ()
 				.append_int32 (channel.code)
-				.append_string (identifier)
-				.build ();
+				.append_string (identifier);
 			try {
 				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
 			} catch (GLib.Error e) {
 				channels.unset (channel.code);
-			}
-		}
-
-		private void process_message (uint8[] raw_message, FragmentFlags fragment_flags) throws Error {
-			const size_t header_size = 16;
-
-			size_t message_size = raw_message.length;
-			if (message_size < header_size)
-				throw new Error.PROTOCOL ("Malformed message");
-
-			uint8 * m = (uint8 *) raw_message;
-
-			MessageType type = (MessageType) *m;
-
-			uint32 aux_size = uint32.from_little_endian (*((uint32 *) (m + 4)));
-			uint64 data_size = uint64.from_little_endian (*((uint64 *) (m + 8)));
-			if (aux_size > message_size || data_size > message_size || data_size != message_size - header_size ||
-					aux_size > data_size) {
-				throw new Error.PROTOCOL ("Malformed message");
-			}
-
-			size_t aux_start_offset = header_size;
-			size_t aux_end_offset = aux_start_offset + aux_size;
-			unowned uint8[] aux_data = raw_message[aux_start_offset:aux_end_offset];
-
-			size_t payload_start_offset = aux_end_offset;
-			size_t payload_end_offset = payload_start_offset + (size_t) (data_size - aux_size);
-			unowned uint8[] payload_data = raw_message[payload_start_offset:payload_end_offset];
-
-			printerr ("[process_message] type=%s raw_message.length=%d aux_data.length=%d payload_data.length=%d fragment_flags=%s\n",
-				type.to_string (),
-				raw_message.length,
-				aux_data.length,
-				payload_data.length,
-				fragment_flags.to_string ());
-
-			if (type == INVOKE) {
-				NSString? method_name = NSKeyedArchive.parse (payload_data) as NSString;
-				if (method_name == null)
-					throw new Error.PROTOCOL ("Malformed message payload");
-				printerr ("method_name: %s\n", method_name.str);
-
-				var args = DTXArgumentList.parse (aux_data);
 			}
 		}
 
@@ -227,7 +185,7 @@ namespace Frida.Fruity {
 					var fragment = yield read_fragment ();
 
 					if (fragment.count == 1) {
-						process_message (fragment.bytes.get_data (), (FragmentFlags) fragment.flags);
+						process_message (fragment.bytes.get_data (), fragment);
 						continue;
 					}
 
@@ -283,7 +241,7 @@ namespace Frida.Fruity {
 						fragments.unset (fragment.identifier);
 						total_buffered -= message.length;
 
-						process_message (message, (FragmentFlags) first_fragment.flags);
+						process_message (message, first_fragment);
 					}
 				} catch (GLib.Error e) {
 					printerr ("DERP: %s\n", e.message);
@@ -343,6 +301,95 @@ namespace Frida.Fruity {
 			}
 		}
 
+		private void process_message (uint8[] raw_message, Fragment fragment) throws Error {
+			const size_t header_size = 16;
+
+			size_t message_size = raw_message.length;
+			if (message_size < header_size)
+				throw new Error.PROTOCOL ("Malformed message");
+
+			uint8 * m = (uint8 *) raw_message;
+
+			var message = DTXMessage ();
+			message.type = (DTXMessageType) *m;
+			message.identifier = fragment.identifier;
+			message.conversation_index = fragment.conversation_index;
+			message.channel_code = fragment.channel_code;
+			message.transport_flags = (DTXMessageTransportFlags) fragment.flags;
+
+			uint32 aux_size = uint32.from_little_endian (*((uint32 *) (m + 4)));
+			uint64 data_size = uint64.from_little_endian (*((uint64 *) (m + 8)));
+			if (aux_size > message_size || data_size > message_size || data_size != message_size - header_size ||
+					aux_size > data_size) {
+				throw new Error.PROTOCOL ("Malformed message");
+			}
+
+			size_t aux_start_offset = header_size;
+			size_t aux_end_offset = aux_start_offset + aux_size;
+			message.aux_data = raw_message[aux_start_offset:aux_end_offset];
+
+			size_t payload_start_offset = aux_end_offset;
+			size_t payload_end_offset = payload_start_offset + (size_t) (data_size - aux_size);
+			message.payload_data = raw_message[payload_start_offset:payload_end_offset];
+
+			var channel = channels[message.channel_code];
+			if (channel != null)
+				channel.process_message (message);
+			else
+				printerr ("Got a message for an unknown channel with channel_code=%d\n", message.channel_code);
+		}
+
+		private void send_message (DTXMessage message) {
+			const size_t message_header_size = 16;
+			uint32 message_aux_size = message.aux_data.length;
+			uint64 message_data_size = message_aux_size + message.payload_data.length;
+			size_t message_size = message_header_size + (size_t) message_data_size;
+			const uint8 message_flags_a = 0;
+			const uint8 message_flags_b = 0;
+			const uint8 message_reserved = 0;
+
+			const uint32 fragment_header_size = 32;
+			const uint16 fragment_index = 0;
+			const uint16 fragment_count = 1;
+			uint32 fragment_data_size = (uint32) message_size;
+			uint32 fragment_identifier = message.identifier;
+			if (fragment_identifier == 0)
+				fragment_identifier = next_fragment_identifier++;
+			uint32 fragment_flags = message.transport_flags;
+
+			var data = new uint8[fragment_header_size + message_size];
+
+			uint8 * p = (uint8 *) data;
+			*((uint32 *) (p + 0)) = DTX_FRAGMENT_MAGIC.to_little_endian ();
+			*((uint32 *) (p + 4)) = fragment_header_size.to_little_endian ();
+			*((uint16 *) (p + 8)) = fragment_index.to_little_endian ();
+			*((uint16 *) (p + 10)) = fragment_count.to_little_endian ();
+			*((uint32 *) (p + 12)) = fragment_data_size.to_little_endian ();
+			*((uint32 *) (p + 16)) = fragment_identifier.to_little_endian ();
+			*((uint32 *) (p + 20)) = message.conversation_index.to_little_endian ();
+			*((int32 *) (p + 24)) = message.channel_code.to_little_endian ();
+			*((uint32 *) (p + 28)) = fragment_flags.to_little_endian ();
+			p += fragment_header_size;
+
+			*(p + 0) = message.type;
+			*(p + 1) = message_flags_a;
+			*(p + 2) = message_flags_b;
+			*(p + 3) = message_reserved;
+			*((uint32 *) (p + 4)) = message_aux_size.to_little_endian ();
+			*((uint64 *) (p + 8)) = message_data_size.to_little_endian ();
+			p += message_header_size;
+
+			Memory.copy (p, message.aux_data, message.aux_data.length);
+			p += message.aux_data.length;
+
+			Memory.copy (p, message.payload_data, message.payload_data.length);
+			p += message.payload_data.length;
+
+			assert (p == (uint8 *) data + data.length);
+
+			write_bytes (new Bytes.take ((owned) data));
+		}
+
 		private async void prepare_to_read (size_t required) throws GLib.Error {
 			while (true) {
 				size_t available = input.get_available ();
@@ -354,12 +401,26 @@ namespace Frida.Fruity {
 			}
 		}
 
-		private enum MessageType {
-			OK = 0,
-			INVOKE = 2,
-			RESULT = 3,
-			ERROR = 4,
-			BARRIER = 5
+		private void write_bytes (Bytes bytes) {
+			pending_writes.offer_tail (bytes);
+			if (pending_writes.size == 1)
+				process_pending_writes.begin ();
+		}
+
+		private async void process_pending_writes () {
+			while (!pending_writes.is_empty) {
+				Bytes current = pending_writes.peek_head ();
+
+				size_t bytes_written;
+				try {
+					yield output.write_all_async (current.get_data (), Priority.DEFAULT, io_cancellable,
+						out bytes_written);
+				} catch (GLib.Error e) {
+					return;
+				}
+
+				pending_writes.poll_head ();
+			}
 		}
 
 		private class Fragment {
@@ -372,11 +433,6 @@ namespace Frida.Fruity {
 			public uint32 flags;
 			public Bytes? bytes;
 		}
-
-		[Flags]
-		private enum FragmentFlags {
-			EXPECTS_REPLY = (1 << 0),
-		}
 	}
 
 	private class DTXChannel : Object {
@@ -385,16 +441,75 @@ namespace Frida.Fruity {
 			construct;
 		}
 
-		public DTXChannel (int32 code) {
-			Object (code: code);
+		public weak DTXTransport transport {
+			get;
+			construct;
+		}
+
+		public DTXChannel (int32 code, DTXTransport transport) {
+			Object (code: code, transport: transport);
 		}
 
 		public async void close (Cancellable? cancellable = null) throws IOError {
 		}
 
-		public async NSObject? invoke (string method_name, Bytes args, Cancellable? cancellable) throws Error, IOError {
+		public async NSObject? invoke (string method_name, DTXArgumentListBuilder args, Cancellable? cancellable)
+				throws Error, IOError {
+			var message = DTXMessage ();
+			message.type = INVOKE;
+			message.channel_code = code;
+			message.transport_flags = EXPECTS_REPLY;
+
+			var aux_data = args.build ();
+			message.aux_data = aux_data.get_data ();
+
+			var payload_data = NSKeyedArchive.unparse (new NSString (method_name));
+			message.payload_data = payload_data;
+
+			transport.send_message (message);
+
 			return null;
 		}
+
+		public void process_message (DTXMessage message) throws Error {
+			printerr ("[DTXChannel %d] process_message() type=%s\n", code, message.type.to_string ());
+
+			if (message.type == INVOKE) {
+				NSString? method_name = NSKeyedArchive.parse (message.payload_data) as NSString;
+				if (method_name == null)
+					throw new Error.PROTOCOL ("Malformed message payload");
+				printerr ("[DTXChannel %d] INVOKE: %s\n", code, method_name.str);
+
+				var args = DTXArgumentList.parse (message.aux_data);
+			}
+		}
+	}
+
+	private interface DTXTransport : Object {
+		public abstract void send_message (DTXMessage message);
+	}
+
+	private enum DTXMessageType {
+		OK = 0,
+		INVOKE = 2,
+		RESULT = 3,
+		ERROR = 4,
+		BARRIER = 5
+	}
+
+	private struct DTXMessage {
+		public DTXMessageType type;
+		public uint32 identifier;
+		public uint32 conversation_index;
+		public int32 channel_code;
+		public DTXMessageTransportFlags transport_flags;
+		public unowned uint8[] aux_data;
+		public unowned uint8[] payload_data;
+	}
+
+	[Flags]
+	public enum DTXMessageTransportFlags {
+		EXPECTS_REPLY = (1 << 0),
 	}
 
 	private class DTXArgumentList {
