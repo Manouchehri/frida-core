@@ -175,6 +175,7 @@ namespace Frida.Fruity {
 			try {
 				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
 			} catch (GLib.Error e) {
+				printerr ("Oopsie: %s\n", e.message);
 				channels.unset (channel.code);
 			}
 		}
@@ -332,14 +333,38 @@ namespace Frida.Fruity {
 			size_t payload_end_offset = payload_start_offset + (size_t) (data_size - aux_size);
 			message.payload_data = raw_message[payload_start_offset:payload_end_offset];
 
-			var channel = channels[message.channel_code];
-			if (channel != null)
-				channel.process_message (message);
-			else
+			int32 channel_code = message.channel_code;
+			bool is_notification = false;
+			if (message.type == RESULT && channel_code < 0) {
+				channel_code = -channel_code;
+				is_notification = true;
+			}
+
+			var channel = channels[channel_code];
+			if (channel == null) {
 				printerr ("Got a message for an unknown channel with channel_code=%d\n", message.channel_code);
+				return;
+			}
+
+			switch (message.type) {
+				case INVOKE:
+					channel.handle_invoke (message);
+					break;
+				case OK:
+				case RESULT:
+				case ERROR:
+					if (is_notification)
+						channel.handle_notification (message);
+					else
+						channel.handle_response (message);
+					break;
+				case BARRIER:
+					channel.handle_barrier (message);
+					break;
+			}
 		}
 
-		private void send_message (DTXMessage message) {
+		private void send_message (DTXMessage message, out uint32 identifier) {
 			const size_t message_header_size = 16;
 			uint32 message_aux_size = message.aux_data.length;
 			uint64 message_data_size = message_aux_size + message.payload_data.length;
@@ -388,6 +413,8 @@ namespace Frida.Fruity {
 			assert (p == (uint8 *) data + data.length);
 
 			write_bytes (new Bytes.take ((owned) data));
+
+			identifier = fragment_identifier;
 		}
 
 		private async void prepare_to_read (size_t required) throws GLib.Error {
@@ -436,6 +463,9 @@ namespace Frida.Fruity {
 	}
 
 	private class DTXChannel : Object {
+		public signal void notification (NSDictionary dict);
+		public signal void barrier ();
+
 		public int32 code {
 			get;
 			construct;
@@ -445,6 +475,8 @@ namespace Frida.Fruity {
 			get;
 			construct;
 		}
+
+		private Gee.HashMap<uint32, Promise<NSObject?>> pending_responses = new Gee.HashMap<uint32, Promise<NSObject?>> ();
 
 		public DTXChannel (int32 code, DTXTransport transport) {
 			Object (code: code, transport: transport);
@@ -466,27 +498,86 @@ namespace Frida.Fruity {
 			var payload_data = NSKeyedArchive.unparse (new NSString (method_name));
 			message.payload_data = payload_data;
 
-			transport.send_message (message);
+			uint32 identifier;
+			transport.send_message (message, out identifier);
+			printerr ("[DTXChannel %d] invoked %s, identifier=%u\n", code, method_name, identifier);
 
-			return null;
+			var request = new Promise<NSObject?> ();
+			pending_responses[identifier] = request;
+
+			try {
+				return yield request.future.wait_async (cancellable);
+			} finally {
+				pending_responses.unset (identifier);
+			}
 		}
 
-		public void process_message (DTXMessage message) throws Error {
-			printerr ("[DTXChannel %d] process_message() type=%s\n", code, message.type.to_string ());
+		internal void handle_invoke (DTXMessage message) throws Error {
+			NSString? method_name = NSKeyedArchive.parse (message.payload_data) as NSString;
+			if (method_name == null)
+				throw new Error.PROTOCOL ("Malformed invocation payload");
 
-			if (message.type == INVOKE) {
-				NSString? method_name = NSKeyedArchive.parse (message.payload_data) as NSString;
-				if (method_name == null)
-					throw new Error.PROTOCOL ("Malformed message payload");
-				printerr ("[DTXChannel %d] INVOKE: %s\n", code, method_name.str);
+			printerr ("[DTXChannel %d] INVOKE: %s\n", code, method_name.str);
 
-				var args = DTXArgumentList.parse (message.aux_data);
+			var args = DTXArgumentList.parse (message.aux_data);
+		}
+
+		internal void handle_response (DTXMessage message) throws Error {
+			printerr ("[DTXChannel %d] RESPONSE type=%s identifier=%u\n", code, message.type.to_string (), message.identifier);
+
+			var request = pending_responses[message.identifier];
+			if (request != null) {
+				switch (message.type) {
+					case OK:
+						request.resolve (null);
+						break;
+					case RESULT:
+						request.resolve (NSKeyedArchive.parse (message.payload_data));
+						break;
+					case ERROR: {
+						NSError? error = NSKeyedArchive.parse (message.payload_data) as NSError;
+						if (error == null)
+							throw new Error.PROTOCOL ("Malformed error payload");
+
+						var description = new StringBuilder.sized (128);
+
+						var user_info = error.user_info;
+						if (user_info != null) {
+							string str;
+							if (user_info.get_optional_string ("NSLocalizedDescription", out str))
+								description.append (str);
+						}
+
+						if (description.len == 0) {
+							description.append_printf ("Invocation failed; domain=%s code=%" +
+									int64.FORMAT_MODIFIER + "d",
+								error.domain.str, error.code);
+						}
+
+						request.reject (new Error.NOT_SUPPORTED ("%s", description.str));
+
+						break;
+					}
+				}
 			}
+		}
+
+		internal void handle_notification (DTXMessage message) throws Error {
+			printerr ("[DTXChannel %d] NOTIFICATION\n", code);
+			NSDictionary? dict = NSKeyedArchive.parse (message.payload_data) as NSDictionary;
+			if (dict == null)
+				throw new Error.PROTOCOL ("Malformed notification payload");
+			notification (dict);
+		}
+
+		internal void handle_barrier (DTXMessage message) throws Error {
+			printerr ("[DTXChannel %d] BARRIER\n", code);
+			barrier ();
 		}
 	}
 
 	private interface DTXTransport : Object {
-		public abstract void send_message (DTXMessage message);
+		public abstract void send_message (DTXMessage message, out uint32 identifier);
 	}
 
 	private enum DTXMessageType {
@@ -650,6 +741,22 @@ namespace Frida.Fruity {
 	}
 
 	private class NSObject {
+		public static uint hash (NSObject val) {
+			NSString? s = val as NSString;
+			if (s != null)
+				return str_hash (s.str);
+
+			return direct_hash (val);
+		}
+
+		public static bool equal (NSObject a, NSObject b) {
+			NSString? sa = a as NSString;
+			NSString? sb = b as NSString;
+			if (sa != null && sb != null)
+				return sa.str == sb.str;
+
+			return a == b;
+		}
 	}
 
 	private class NSNumber : NSObject {
@@ -671,14 +778,6 @@ namespace Frida.Fruity {
 
 		public NSString (string str) {
 			this.str = str;
-		}
-
-		public static uint hash (NSString val) {
-			return str_hash (val.str);
-		}
-
-		public bool equal (NSString a, NSString b) {
-			return str_equal (a.str, b.str);
 		}
 	}
 
@@ -705,6 +804,52 @@ namespace Frida.Fruity {
 
 		public NSDictionary (Gee.HashMap<NSObject, NSObject> storage) {
 			this.storage = storage;
+		}
+
+		public string get_string (string key) throws Error {
+			string val;
+			if (!get_optional_string (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
+			return val;
+		}
+
+		public bool get_optional_string (string key, out string val) throws Error {
+			NSObject? opaque_obj = storage[new NSString (key)];
+			if (opaque_obj == null) {
+				return false;
+			}
+
+			NSString? str_obj = opaque_obj as NSString;
+			if (str_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
+					key, Type.from_instance (opaque_obj).name ());
+			}
+
+			val = str_obj.str;
+			return true;
+		}
+	}
+
+	private class NSError : NSObject {
+		public NSString domain {
+			get;
+			private set;
+		}
+
+		public int64 code {
+			get;
+			private set;
+		}
+
+		public NSDictionary user_info {
+			get;
+			private set;
+		}
+
+		public NSError (NSString domain, int64 code, NSDictionary user_info) {
+			this.domain = domain;
+			this.code = code;
+			this.user_info = user_info;
 		}
 	}
 
@@ -779,38 +924,38 @@ namespace Frida.Fruity {
 
 			decoders = new Gee.HashMap<string, DecodeFunc> ();
 			decoders["NSDictionary"] = decode_dictionary;
+			decoders["NSError"] = decode_error;
 		}
 
 		private static NSObject decode_dictionary (PlistDict instance, PlistArray objects) throws Error, PlistError {
 			var keys = instance.get_array ("NS.keys");
 			var objs = instance.get_array ("NS.objects");
 
-			Gee.HashMap<NSObject, NSObject> storage = null;
+			var storage = new Gee.HashMap<NSObject, NSObject> (NSObject.hash, NSObject.equal);
 
 			var n = keys.length;
 			for (int i = 0; i != n; i++) {
 				var key = decode_value (keys.get_uid (i), objects);
 				var obj = decode_value (objs.get_uid (i), objects);
 
-				if (storage == null) {
-					Gee.HashDataFunc<NSObject> key_hash = null;
-					Gee.EqualDataFunc<NSObject> key_equal = null;
-
-					if (key is NSString) {
-						key_hash = (Gee.HashDataFunc<NSObject>) NSString.hash;
-						key_equal = (Gee.EqualDataFunc<NSObject>) NSString.equal;
-					}
-
-					storage = new Gee.HashMap<NSObject, NSObject> ((owned) key_hash, (owned) key_equal);
-				}
-
 				storage[key] = obj;
 			}
 
-			if (storage == null)
-				storage = new Gee.HashMap<NSObject, NSObject> ();
-
 			return new NSDictionary (storage);
+		}
+
+		private static NSObject decode_error (PlistDict instance, PlistArray objects) throws Error, PlistError {
+			NSString? domain = decode_value (instance.get_uid ("NSDomain"), objects) as NSString;
+			if (domain == null)
+				throw new Error.PROTOCOL ("Malformed NSError");
+
+			int64 code = instance.get_integer ("NSCode");
+
+			NSObject? user_info = decode_value (instance.get_uid ("NSUserInfo"), objects);
+			if (user_info != null && !(user_info is NSDictionary))
+				throw new Error.PROTOCOL ("Malformed NSError");
+
+			return new NSError (domain, code, (NSDictionary) user_info);
 		}
 	}
 
