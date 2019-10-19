@@ -10,6 +10,10 @@ namespace Frida.Fruity {
 			parser.parse (xml);
 		}
 
+		public uint8[] to_binary () {
+			return new uint8[0];
+		}
+
 		public string to_xml () {
 			var builder = new StringBuilder ();
 			var writer = new XmlWriter (builder);
