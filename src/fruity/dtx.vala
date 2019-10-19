@@ -860,34 +860,41 @@ namespace Frida.Fruity {
 		private Gee.HashMap<string, DecodeFunc> decoders;
 
 		[CCode (has_target = false)]
-		private delegate PlistUid EncodeFunc (NSObject instance, PlistArray objects) throws Error;
+		private delegate PlistUid EncodeFunc (NSObject instance, PlistArray objects);
 
 		[CCode (has_target = false)]
 		private delegate NSObject DecodeFunc (PlistDict instance, PlistArray objects) throws Error, PlistError;
 
-		private static uint8[] encode (NSObject? obj) throws Error {
+		private static uint8[] encode (NSObject? obj) {
 			if (obj == null)
 				return new uint8[0];
 
 			ensure_encoders_registered ();
 
-			var type = Type.from_instance (obj);
-			var encode = encoders[type];
-			if (encode == null)
-				throw new Error.NOT_SUPPORTED ("Missing NSKeyedArchive encoder for type “%s”", type.name ());
-
 			var objects = new PlistArray ();
+			objects.add_string ("$null");
 
 			var top = new PlistDict ();
-			top.set_uid ("root", encode (obj, objects));
+			top.set_uid ("root", encode_value (obj, objects));
 
 			var plist = new Plist ();
 			plist.set_integer ("$version", 100000);
 			plist.set_array ("$objects", objects);
 			plist.set_string ("$archiver", "NSKeyedArchiver");
 			plist.set_dict ("$top", top);
-
 			return plist.to_binary ();
+		}
+
+		private static PlistUid encode_value (NSObject? obj, PlistArray objects) {
+			if (obj == null)
+				return new PlistUid (0);
+
+			var type = Type.from_instance (obj);
+			var encode_object = encoders[type];
+			if (encode_object == null)
+				critical ("Missing NSKeyedArchive encoder for type “%s”", type.name ());
+
+			return encode_object (obj, objects);
 		}
 
 		private static NSObject? decode (uint8[] data) throws Error {
@@ -950,6 +957,7 @@ namespace Frida.Fruity {
 				return;
 
 			encoders = new Gee.HashMap<Type, EncodeFunc> ();
+			encoders[typeof (NSString)] = encode_string;
 		}
 
 		private static void ensure_decoders_registered () {
@@ -959,6 +967,29 @@ namespace Frida.Fruity {
 			decoders = new Gee.HashMap<string, DecodeFunc> ();
 			decoders["NSDictionary"] = decode_dictionary;
 			decoders["NSError"] = decode_error;
+		}
+
+		private static PlistUid encode_string (NSObject instance, PlistArray objects) {
+			string str = (instance as NSString).str;
+
+			var uid = find_existing_object (objects, e => e.holds (typeof (string)) && e.get_string () == str);
+			if (uid != null)
+				return uid;
+
+			uid = new PlistUid (objects.length);
+			objects.add_string (str);
+			return uid;
+		}
+
+		private static PlistUid? find_existing_object (PlistArray objects, Gee.Predicate<Value?> predicate) {
+			int64 uid = 0;
+			foreach (var e in objects.elements) {
+				if (uid > 0 && predicate (e))
+					return new PlistUid (uid);
+				uid++;
+			}
+
+			return null;
 		}
 
 		private static NSObject decode_dictionary (PlistDict instance, PlistArray objects) throws Error, PlistError {
