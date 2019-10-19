@@ -495,7 +495,7 @@ namespace Frida.Fruity {
 			var aux_data = args.build ();
 			message.aux_data = aux_data.get_data ();
 
-			var payload_data = NSKeyedArchive.unparse (new NSString (method_name));
+			var payload_data = NSKeyedArchive.encode (new NSString (method_name));
 			message.payload_data = payload_data;
 
 			uint32 identifier;
@@ -513,7 +513,7 @@ namespace Frida.Fruity {
 		}
 
 		internal void handle_invoke (DTXMessage message) throws Error {
-			NSString? method_name = NSKeyedArchive.parse (message.payload_data) as NSString;
+			NSString? method_name = NSKeyedArchive.decode (message.payload_data) as NSString;
 			if (method_name == null)
 				throw new Error.PROTOCOL ("Malformed invocation payload");
 
@@ -532,10 +532,10 @@ namespace Frida.Fruity {
 						request.resolve (null);
 						break;
 					case RESULT:
-						request.resolve (NSKeyedArchive.parse (message.payload_data));
+						request.resolve (NSKeyedArchive.decode (message.payload_data));
 						break;
 					case ERROR: {
-						NSError? error = NSKeyedArchive.parse (message.payload_data) as NSError;
+						NSError? error = NSKeyedArchive.decode (message.payload_data) as NSError;
 						if (error == null)
 							throw new Error.PROTOCOL ("Malformed error payload");
 
@@ -564,7 +564,7 @@ namespace Frida.Fruity {
 
 		internal void handle_notification (DTXMessage message) throws Error {
 			printerr ("[DTXChannel %d] NOTIFICATION\n", code);
-			NSDictionary? dict = NSKeyedArchive.parse (message.payload_data) as NSDictionary;
+			NSDictionary? dict = NSKeyedArchive.decode (message.payload_data) as NSDictionary;
 			if (dict == null)
 				throw new Error.PROTOCOL ("Malformed notification payload");
 			notification (dict);
@@ -640,7 +640,7 @@ namespace Frida.Fruity {
 						size_t size = reader.read_uint32 ();
 						unowned uint8[] buf = reader.read_byte_array (size);
 
-						NSObject? obj = NSKeyedArchive.parse (buf);
+						NSObject? obj = NSKeyedArchive.decode (buf);
 						if (obj != null) {
 							var gval = Value (Type.from_instance (obj));
 							gval.set_instance (obj);
@@ -703,7 +703,7 @@ namespace Frida.Fruity {
 
 		public unowned DTXArgumentListBuilder append_object (NSObject? obj) {
 			begin_entry (BUFFER)
-				.append_byte_array (NSKeyedArchive.unparse (obj));
+				.append_byte_array (NSKeyedArchive.encode (obj));
 			return this;
 		}
 
@@ -813,7 +813,9 @@ namespace Frida.Fruity {
 			return val;
 		}
 
-		public bool get_optional_string (string key, out string val) throws Error {
+		public bool get_optional_string (string key, out string? val) throws Error {
+			val = null;
+
 			NSObject? opaque_obj = storage[new NSString (key)];
 			if (opaque_obj == null) {
 				return false;
@@ -854,19 +856,48 @@ namespace Frida.Fruity {
 	}
 
 	namespace NSKeyedArchive {
+		private Gee.HashMap<Type, EncodeFunc> encoders;
 		private Gee.HashMap<string, DecodeFunc> decoders;
+
+		[CCode (has_target = false)]
+		private delegate PlistUid EncodeFunc (NSObject instance, PlistArray objects) throws Error;
 
 		[CCode (has_target = false)]
 		private delegate NSObject DecodeFunc (PlistDict instance, PlistArray objects) throws Error, PlistError;
 
-		private static NSObject? parse (uint8[] data) throws Error {
+		private static uint8[] encode (NSObject? obj) throws Error {
+			if (obj == null)
+				return new uint8[0];
+
+			ensure_encoders_registered ();
+
+			var type = Type.from_instance (obj);
+			var encode = encoders[type];
+			if (encode == null)
+				throw new Error.NOT_SUPPORTED ("Missing NSKeyedArchive encoder for type “%s”", type.name ());
+
+			var objects = new PlistArray ();
+
+			var top = new PlistDict ();
+			top.set_uid ("root", encode (obj, objects));
+
+			var plist = new Plist ();
+			plist.set_integer ("$version", 100000);
+			plist.set_array ("$objects", objects);
+			plist.set_string ("$archiver", "NSKeyedArchiver");
+			plist.set_dict ("$top", top);
+
+			return plist.to_binary ();
+		}
+
+		private static NSObject? decode (uint8[] data) throws Error {
 			ensure_decoders_registered ();
 
 			try {
 				var plist = new Plist.from_binary (data);
 
 				/*
-				printerr ("parse: %s\n", plist.to_xml ());
+				printerr ("decode: %s\n", plist.to_xml ());
 				FileUtils.set_data ("/Users/oleavr/VMShared/nskeyedarchive.plist", data);
 				*/
 
@@ -874,10 +905,6 @@ namespace Frida.Fruity {
 			} catch (PlistError e) {
 				throw new Error.PROTOCOL ("%s", e.message);
 			}
-		}
-
-		private static uint8[] unparse (NSObject? obj) {
-			return new uint8[0];
 		}
 
 		private static NSObject? decode_value (PlistUid index, PlistArray objects) throws Error, PlistError {
@@ -901,7 +928,7 @@ namespace Frida.Fruity {
 				return decode (instance, objects);
 			}
 
-			throw new Error.PROTOCOL ("Unsupported NSKeyedArchive type: %s", val.type_name ());
+			throw new Error.NOT_SUPPORTED ("Unsupported NSKeyedArchive type: %s", val.type_name ());
 		}
 
 		private static DecodeFunc get_decoder (PlistDict klass) throws Error, PlistError {
@@ -915,7 +942,14 @@ namespace Frida.Fruity {
 					return decoder;
 			}
 
-			throw new Error.PROTOCOL ("No decoder for NSKeyedArchive type “%s”", klass.get_string ("$classname"));
+			throw new Error.NOT_SUPPORTED ("Missing NSKeyedArchive decoder for type “%s”", klass.get_string ("$classname"));
+		}
+
+		private static void ensure_encoders_registered () {
+			if (encoders != null)
+				return;
+
+			encoders = new Gee.HashMap<Type, EncodeFunc> ();
 		}
 
 		private static void ensure_decoders_registered () {
