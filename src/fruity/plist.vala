@@ -1,5 +1,7 @@
 namespace Frida.Fruity {
 	public class Plist : PlistDict {
+		private const uint64 EPOCH = 978307200;
+
 		public Plist.from_binary (uint8[] data) throws PlistError {
 			var parser = new BinaryParser (this);
 			parser.parse (data);
@@ -47,8 +49,6 @@ namespace Frida.Fruity {
 			private uint64 offset_table_offset;
 
 			private uint8 object_info;
-
-			private const uint64 EPOCH = 978307200;
 
 			private const uint64 MAX_OBJECT_SIZE = 100 * 1024 * 1024;
 			private const uint64 MAX_OBJECT_COUNT = 32 * 1024;
@@ -392,73 +392,414 @@ namespace Frida.Fruity {
 
 		private class BinaryWriter {
 			private DataOutputStream output;
-			private Gee.HashMap<Value *, Entry> entries = new Gee.HashMap<Value *, Entry> (hash_value, compare_values_eq);
+			private Seekable seekable;
+
 			private Gee.ArrayList<Value *> temporary_values = new Gee.ArrayList<Value *> ();
 			private uint next_id = 0;
 
+			private uint8 offset_size;
+			private uint8 object_ref_size;
+
 			public BinaryWriter (OutputStream stream) {
 				output = new DataOutputStream (stream);
+				output.byte_order = BIG_ENDIAN;
+				seekable = (Seekable) output;
 			}
 
-			~BinaryWriter () {
+			private void reset () {
+				next_id = 0;
+
 				temporary_values.foreach (free_value);
+				temporary_values.clear ();
 			}
 
 			public void write_plist (Plist plist) throws IOError {
-				output.put_string ("bplist00");
+				try {
+					output.put_string ("bplist00");
 
-				var root = make_value (typeof (PlistDict));
-				root.set_object (plist);
-				temporary_values.add (root);
-				collect_value (root);
+					var unique_entries = new Gee.HashMap<Value *, Entry> (hash_value, compare_values_eq);
+					var root = make_value (typeof (PlistDict));
+					root.set_object (plist);
+					temporary_values.add (root);
+					var root_entry = collect_value (root, unique_entries);
+					uint num_objects = unique_entries.size;
+					object_ref_size = compute_object_ref_size (num_objects);
 
-				printerr ("Have %u entries\n", entries.size);
+					var sorted_entries = new Gee.ArrayList<Entry> ();
+					sorted_entries.add_all (unique_entries.values);
+					sorted_entries.sort ((a, b) => (int) a.id - (int) b.id);
+
+					foreach (var entry in sorted_entries)
+						write_entry (entry);
+
+					size_t offset_table_offset = (size_t) seekable.tell ();
+					offset_size = compute_offset_size (sorted_entries.last ().offset);
+					foreach (var entry in sorted_entries)
+						write_offset (entry.offset);
+
+					const uint trailer_null_pad_size = 6;
+					for (uint i = 0; i != trailer_null_pad_size; i++)
+						output.put_byte (0x00);
+					output.put_byte (offset_size);
+					output.put_byte (object_ref_size);
+					output.put_uint64 (num_objects);
+					output.put_uint64 (root_entry.id);
+					output.put_uint64 (offset_table_offset);
+				} finally {
+					reset ();
+				}
 			}
 
-			private void collect_value (Value * v) {
-				Entry? entry = entries[v];
+			private Entry collect_value (Value * v, Gee.HashMap<Value *, Entry> unique_entries) {
+				bool is_dict = v.holds (typeof (PlistDict));
+				bool is_array = v.holds (typeof (PlistArray));
+
+				Entry? entry = unique_entries[v];
 				if (entry == null) {
-					entry = new Entry (next_id++);
-					entries[v] = entry;
+					uint id = next_id++;
+					if (is_dict)
+						entry = new DictEntry (id, v);
+					else if (is_array)
+						entry = new ArrayEntry (id, v);
+					else
+						entry = new Entry (id, v);
+					unique_entries[v] = entry;
 				}
 
-				if (v.holds (typeof (PlistDict))) {
+				if (is_dict) {
 					var dict = (PlistDict) v.get_object ();
+					DictEntry dict_entry = (DictEntry) entry;
 
-					foreach (var key in dict.keys) {
+					var values = new Gee.ArrayList<Value *> ();
+
+					foreach (var e in dict.entries) {
 						var k = make_value (typeof (string));
-						k.take_string ((owned) key);
-						if (!entries.has_key (k)) {
-							entries[k] = new Entry (next_id++);
+						k.set_string (e.key);
+						Entry? key_entry = unique_entries[k];
+						if (key_entry == null) {
+							key_entry = new Entry (next_id++, k);
+							unique_entries[k] = key_entry;
 							temporary_values.add (k);
 						} else {
 							free_value (k);
 						}
+						dict_entry.keys.add (key_entry);
+
+						values.add (e.value);
 					}
 
-					foreach (var val in dict.values)
-						collect_value (val);
+					foreach (var val in values) {
+						var val_entry = collect_value (val, unique_entries);
+						dict_entry.values.add (val_entry);
+					}
 
-					return;
+					return entry;
 				}
 
-				if (v.holds (typeof (PlistArray))) {
+				if (is_array) {
 					var array = (PlistArray) v.get_object ();
+					ArrayEntry array_entry = (ArrayEntry) entry;
 
-					foreach (var val in array.elements)
-						collect_value (val);
+					foreach (var val in array.elements) {
+						var element_entry = collect_value (val, unique_entries);
+						array_entry.elements.add (element_entry);
+					}
 
+					return entry;
+				}
+
+				return entry;
+			}
+
+			private void write_entry (Entry entry) throws IOError {
+				entry.offset = seekable.tell ();
+
+				Value * val = entry.val;
+				Type t = val.type ();
+
+				if (t == typeof (PlistNull)) {
+					write_null ();
 					return;
 				}
+
+				if (t == typeof (bool)) {
+					write_boolean (val.get_boolean ());
+					return;
+				}
+
+				if (t == typeof (int64)) {
+					write_integer (val.get_int64 ());
+					return;
+				}
+
+				if (t == typeof (float)) {
+					write_float (val.get_float ());
+					return;
+				}
+
+				if (t == typeof (double)) {
+					write_double (val.get_double ());
+					return;
+				}
+
+				if (t == typeof (PlistDate)) {
+					write_date ((PlistDate) val.get_object ());
+					return;
+				}
+
+				if (t == typeof (Bytes)) {
+					write_data ((Bytes) val.get_boxed ());
+					return;
+				}
+
+				if (t == typeof (string)) {
+					write_string (val.get_string ());
+					return;
+				}
+
+				if (t == typeof (PlistUid)) {
+					write_uid ((PlistUid) val.get_object ());
+					return;
+				}
+
+				if (t == typeof (PlistArray)) {
+					write_array ((PlistArray) val.get_object (), (ArrayEntry) entry);
+					return;
+				}
+
+				if (t == typeof (PlistDict)) {
+					write_dict ((PlistDict) val.get_object (), (DictEntry) entry);
+					return;
+				}
+
+				assert_not_reached ();
+			}
+
+			private void write_null () throws IOError {
+				output.put_byte (0x00);
+			}
+
+			private void write_boolean (bool val) throws IOError {
+				output.put_byte (0x08 | (val ? 0x01 : 0x00));
+			}
+
+			private void write_integer (int64 val) throws IOError {
+				if (val >= 0 && val <= uint8.MAX) {
+					output.put_byte (0x10);
+					output.put_byte ((uint8) val);
+					return;
+				}
+
+				if (val >= 0 && val <= uint16.MAX) {
+					output.put_byte (0x11);
+					output.put_uint16 ((uint16) val);
+					return;
+				}
+
+				if (val >= 0 && val <= uint32.MAX) {
+					output.put_byte (0x12);
+					output.put_uint32 ((uint32) val);
+					return;
+				}
+
+				output.put_byte (0x13);
+				output.put_int64 (val);
+			}
+
+			private void write_float (float val) throws IOError {
+				output.put_byte (0x22);
+
+				uint32 bits = *((uint32 *) &val);
+				output.put_uint32 (bits);
+			}
+
+			private void write_double (double val) throws IOError {
+				output.put_byte (0x23);
+
+				uint64 bits = *((uint64 *) &val);
+				output.put_uint64 (bits);
+			}
+
+			private void write_date (PlistDate date) throws IOError {
+				output.put_byte (0x30);
+
+				var val = date.get_time ();
+				double point_in_time = (double) (val.tv_sec - EPOCH) + ((double) val.tv_usec * 1000000.0);
+				uint64 bits = *((uint64 *) &point_in_time);
+				output.put_uint64 (bits);
+			}
+
+			private void write_data (Bytes bytes) throws IOError {
+				var data = bytes.get_data ();
+
+				write_size_header (0x4, data.length);
+
+				size_t bytes_written;
+				output.write_all (data, out bytes_written);
+			}
+
+			private void write_string (string str) throws IOError {
+				int native_size = str.length;
+				if (str.char_count () == native_size) {
+					write_size_header (0x5, native_size);
+
+					output.put_string (str);
+				} else {
+					long num_chars;
+					string16 utf16_str;
+					try {
+						utf16_str = str.to_utf16 (-1, null, out num_chars);
+					} catch (ConvertError e) {
+						assert_not_reached ();
+					}
+					unowned uint16[] chars = ((uint16[]) utf16_str)[0:num_chars];
+					for (long i = 0; i != num_chars; i++)
+						chars[i] = chars[i].to_big_endian ();
+
+					size_t size = num_chars * sizeof (uint16);
+					write_size_header (0x6, size);
+
+					unowned uint8[] data = ((uint8[]) chars)[0:size];
+					size_t bytes_written;
+					output.write_all (data, out bytes_written);
+				}
+			}
+
+			private void write_uid (PlistUid val) throws IOError {
+				output.put_byte (0x30 | (object_ref_size - 1));
+
+				write_ref ((uint) val.uid);
+			}
+
+			private void write_array (PlistArray array, ArrayEntry array_entry) throws IOError {
+				write_size_header (0xa, array.length);
+
+				foreach (var entry in array_entry.elements)
+					write_ref (entry.id);
+			}
+
+			private void write_dict (PlistDict dict, DictEntry dict_entry) throws IOError {
+				write_size_header (0xd, dict.size);
+
+				foreach (var entry in dict_entry.keys)
+					write_ref (entry.id);
+
+				foreach (var entry in dict_entry.values)
+					write_ref (entry.id);
+			}
+
+			private void write_size_header (uint8 object_type, size_t size) throws IOError {
+				if (size < 15) {
+					output.put_byte ((object_type << 4) | (uint8) size);
+					return;
+				}
+
+				output.put_byte ((object_type << 4) | 0x0f);
+
+				if (size <= uint8.MAX) {
+					output.put_byte (0x10);
+					output.put_byte ((uint8) size);
+					return;
+				}
+
+				if (size <= uint16.MAX) {
+					output.put_byte (0x11);
+					output.put_uint16 ((uint16) size);
+					return;
+				}
+
+				if (size <= uint32.MAX) {
+					output.put_byte (0x12);
+					output.put_uint32 ((uint32) size);
+					return;
+				}
+
+				assert_not_reached ();
+			}
+
+			private void write_offset (uint64 offset) throws IOError {
+				switch (offset_size) {
+					case 1:
+						output.put_byte ((uint8) offset);
+						break;
+					case 2:
+						output.put_uint16 ((uint16) offset);
+						break;
+					case 4:
+						output.put_uint32 ((uint32) offset);
+						break;
+					case 8:
+						output.put_uint64 (offset);
+						break;
+					default:
+						assert_not_reached ();
+				}
+			}
+
+			private void write_ref (uint id) throws IOError {
+				switch (object_ref_size) {
+					case 1:
+						output.put_byte ((uint8) id);
+						break;
+					case 2:
+						output.put_uint16 ((uint16) id);
+						break;
+					case 4:
+						output.put_uint32 (id);
+						break;
+					default:
+						assert_not_reached ();
+				}
+			}
+
+			private static uint8 compute_offset_size (uint64 largest_offset) {
+				if (largest_offset <= uint8.MAX)
+					return (uint8) sizeof (uint8);
+
+				if (largest_offset <= uint16.MAX)
+					return (uint8) sizeof (uint16);
+
+				if (largest_offset <= uint32.MAX)
+					return (uint8) sizeof (uint32);
+
+				return (uint8) sizeof (uint64);
+			}
+
+			private static uint8 compute_object_ref_size (uint num_ids) {
+				if (num_ids <= uint8.MAX)
+					return (uint8) sizeof (uint8);
+
+				if (num_ids <= uint16.MAX)
+					return (uint8) sizeof (uint16);
+
+				return (uint8) sizeof (uint32);
 			}
 
 			private class Entry {
 				public uint id;
 				public uint64 offset;
+				public Value * val;
 
-				public Entry (uint id) {
+				public Entry (uint id, Value * val) {
 					this.id = id;
-					this.offset = 0;
+					this.val = val;
+				}
+			}
+
+			private class DictEntry : Entry {
+				public Gee.ArrayList<Entry> keys = new Gee.ArrayList<Entry> ();
+				public Gee.ArrayList<Entry> values = new Gee.ArrayList<Entry> ();
+
+				public DictEntry (uint id, Value * val) {
+					base (id, val);
+				}
+			}
+
+			private class ArrayEntry : Entry {
+				public Gee.ArrayList<Entry> elements = new Gee.ArrayList<Entry> ();
+
+				public ArrayEntry (uint id, Value * val) {
+					base (id, val);
 				}
 			}
 		}
@@ -806,6 +1147,12 @@ namespace Frida.Fruity {
 		public int size {
 			get {
 				return storage.size;
+			}
+		}
+
+		public Gee.Set<Gee.Map.Entry<string, Value *>> entries {
+			owned get {
+				return storage.entries;
 			}
 		}
 
@@ -1167,6 +1514,15 @@ namespace Frida.Fruity {
 
 		if (t == typeof (Bytes) || t == typeof (PlistDict) || t == typeof (PlistArray))
 			return a.get_object () == b.get_object ();
+
+		if (t == typeof (PlistNull))
+			return true;
+
+		if (t == typeof (PlistDate)) {
+			TimeVal tva = ((PlistDate) a.get_object ()).get_time ();
+			TimeVal tvb = ((PlistDate) b.get_object ()).get_time ();
+			return (tva.tv_sec == tvb.tv_sec) && (tva.tv_usec == tvb.tv_usec);
+		}
 
 		if (t == typeof (PlistUid))
 			return ((PlistUid) a.get_object ()).uid == ((PlistUid) b.get_object ()).uid;
