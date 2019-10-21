@@ -865,6 +865,9 @@ namespace Frida.Fruity {
 		[CCode (has_target = false)]
 		private delegate NSObject DecodeFunc (PlistDict instance, PlistArray objects) throws Error, PlistError;
 
+		private static bool incoming_written = false;
+		private static bool outgoing_written = false;
+
 		private static uint8[] encode (NSObject? obj) {
 			if (obj == null)
 				return new uint8[0];
@@ -882,7 +885,16 @@ namespace Frida.Fruity {
 			plist.set_array ("$objects", objects);
 			plist.set_string ("$archiver", "NSKeyedArchiver");
 			plist.set_dict ("$top", top);
-			return plist.to_binary ();
+
+			var data = plist.to_binary ();
+
+			if (!outgoing_written) {
+				printerr ("encode: %s\n", plist.to_xml ());
+				FileUtils.set_data ("/Users/oleavr/VMShared/outgoing.plist", data);
+				outgoing_written = true;
+			}
+
+			return data;
 		}
 
 		private static PlistUid encode_value (NSObject? obj, PlistArray objects) {
@@ -903,10 +915,11 @@ namespace Frida.Fruity {
 			try {
 				var plist = new Plist.from_binary (data);
 
-				/*
-				printerr ("decode: %s\n", plist.to_xml ());
-				FileUtils.set_data ("/Users/oleavr/VMShared/nskeyedarchive.plist", data);
-				*/
+				if (!incoming_written) {
+					printerr ("decode: %s\n", plist.to_xml ());
+					FileUtils.set_data ("/Users/oleavr/VMShared/incoming.plist", data);
+					incoming_written = true;
+				}
 
 				return decode_value (plist.get_dict ("$top").get_uid ("root"), plist.get_array ("$objects"));
 			} catch (PlistError e) {
@@ -919,7 +932,7 @@ namespace Frida.Fruity {
 			if (uid == 0)
 				return null;
 
-			Value val = objects.get_value ((int) uid);
+			Value * val = objects.get_value ((int) uid);
 			Type t = val.type ();
 
 			if (t == typeof (int64))
@@ -981,7 +994,7 @@ namespace Frida.Fruity {
 			return uid;
 		}
 
-		private static PlistUid? find_existing_object (PlistArray objects, Gee.Predicate<Value?> predicate) {
+		private static PlistUid? find_existing_object (PlistArray objects, Gee.Predicate<Value *> predicate) {
 			int64 uid = 0;
 			foreach (var e in objects.elements) {
 				if (uid > 0 && predicate (e))
