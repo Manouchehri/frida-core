@@ -48,10 +48,6 @@ namespace Frida.Fruity {
 
 			printerr ("Got %u processes\n", processes.length);
 
-			var name_key = new NSString ("name");
-			var pid_key = new NSString ("pid");
-			var real_app_name_key = new NSString ("realAppName");
-			var foreground_running_key = new NSString ("foregroundRunning");
 			var start_date_key = new NSString ("startDate");
 
 			foreach (var element in processes.elements) {
@@ -61,14 +57,16 @@ namespace Frida.Fruity {
 
 				var info = new ProcessInfo ();
 
-				info.pid = (uint) process.get_integer_by_raw_key (pid_key);
+				info.pid = (uint) process.get_integer ("pid");
 
-				info.name = process.get_string_by_raw_key (name_key);
-				info.real_app_name = process.get_string_by_raw_key (name_key);
+				info.name = process.get_string ("name");
+				info.real_app_name = process.get_string ("realAppName");
 
 				bool foreground_running;
-				if (process.get_optional_boolean_by_raw_key (foreground_running_key, out foreground_running))
+				if (process.get_optional_boolean ("foregroundRunning", out foreground_running))
 					info.foreground_running = foreground_running;
+
+				// info.start_date = process.get_date ("startDate");
 
 				printerr ("name: \"%s\" pid=%u\n", info.name, info.pid);
 
@@ -813,25 +811,24 @@ namespace Frida.Fruity {
 	}
 
 	private class NSObject {
+		public virtual uint hash () {
+			return (uint) this;
+		}
+
+		public virtual bool is_equal_to (NSObject other) {
+			return other == this;
+		}
+
 		public virtual string to_string () {
 			return "NSObject";
 		}
 
-		public static uint hash (NSObject val) {
-			NSString? s = val as NSString;
-			if (s != null)
-				return str_hash (s.str);
-
-			return direct_hash (val);
+		public static uint hash_func (NSObject val) {
+			return val.hash ();
 		}
 
-		public static bool equal (NSObject a, NSObject b) {
-			NSString? sa = a as NSString;
-			NSString? sb = b as NSString;
-			if (sa != null && sb != null)
-				return sa.str == sb.str;
-
-			return a == b;
+		public static bool equal_func (NSObject a, NSObject b) {
+			return a.is_equal_to (b);
 		}
 	}
 
@@ -855,6 +852,21 @@ namespace Frida.Fruity {
 			boolean = (val != 0) ? true : false;
 			integer = val;
 		}
+
+		public override uint hash () {
+			return (uint) integer;
+		}
+
+		public override bool is_equal_to (NSObject other) {
+			var other_number = other as NSNumber;
+			if (other_number == null)
+				return false;
+			return other_number.integer == integer;
+		}
+
+		public override string to_string () {
+			return integer.to_string ();
+		}
 	}
 
 	private class NSString : NSObject {
@@ -866,9 +878,132 @@ namespace Frida.Fruity {
 		public NSString (string str) {
 			this.str = str;
 		}
+
+		public override uint hash () {
+			return str.hash ();
+		}
+
+		public override bool is_equal_to (NSObject other) {
+			var other_string = other as NSString;
+			if (other_string == null)
+				return false;
+			return other_string.str == str;
+		}
+
+		public override string to_string () {
+			return str;
+		}
 	}
 
 	private class NSDictionary : NSObject {
+		public int size {
+			get {
+				return storage.size;
+			}
+		}
+
+		public Gee.Set<Gee.Map.Entry<string, NSObject>> entries {
+			owned get {
+				return storage.entries;
+			}
+		}
+
+		public Gee.Iterable<string> keys {
+			owned get {
+				return storage.keys;
+			}
+		}
+
+		public Gee.Iterable<NSObject> values {
+			owned get {
+				return storage.values;
+			}
+		}
+
+		private Gee.HashMap<string, NSObject> storage;
+
+		public NSDictionary (Gee.HashMap<string, NSObject>? storage = null) {
+			this.storage = (storage != null) ? storage : new Gee.HashMap<string, NSObject> ();
+		}
+
+		public bool get_boolean (string key) throws Error {
+			bool val;
+			if (!get_optional_boolean (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
+			return val;
+		}
+
+		public bool get_optional_boolean (string key, out bool val) throws Error {
+			val = false;
+
+			NSObject? opaque_obj = storage[key];
+			if (opaque_obj == null)
+				return false;
+
+			NSNumber? number_obj = opaque_obj as NSNumber;
+			if (number_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
+					key.to_string (), Type.from_instance (opaque_obj).name ());
+			}
+
+			val = number_obj.boolean;
+			return true;
+		}
+
+		public int64 get_integer (string key) throws Error {
+			int64 val;
+			if (!get_optional_integer (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
+			return val;
+		}
+
+		public bool get_optional_integer (string key, out int64 val) throws Error {
+			val = -1;
+
+			NSObject? opaque_obj = storage[key];
+			if (opaque_obj == null)
+				return false;
+
+			NSNumber? number_obj = opaque_obj as NSNumber;
+			if (number_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
+					key.to_string (), Type.from_instance (opaque_obj).name ());
+			}
+
+			val = number_obj.integer;
+			return true;
+		}
+
+		public void set_integer (string key, int64 val) {
+			storage[key] = new NSNumber.from_integer (val);
+		}
+
+		public unowned string get_string (string key) throws Error {
+			unowned string val;
+			if (!get_optional_string (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
+			return val;
+		}
+
+		public bool get_optional_string (string key, out unowned string? val) throws Error {
+			val = null;
+
+			NSObject? opaque_obj = storage[key];
+			if (opaque_obj == null)
+				return false;
+
+			NSString? str_obj = opaque_obj as NSString;
+			if (str_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
+					key.to_string (), Type.from_instance (opaque_obj).name ());
+			}
+
+			val = str_obj.str;
+			return true;
+		}
+	}
+
+	private class NSDictionaryRaw : NSObject {
 		public int size {
 			get {
 				return storage.size;
@@ -895,117 +1030,10 @@ namespace Frida.Fruity {
 
 		private Gee.HashMap<NSObject, NSObject> storage;
 
-		public NSDictionary (Gee.HashMap<NSObject, NSObject>? storage = null) {
-			this.storage = (storage != null) ? storage : new Gee.HashMap<NSObject, NSObject> (NSObject.hash, NSObject.equal);
-		}
-
-		public bool get_boolean (string key) throws Error {
-			bool val;
-			if (!get_optional_boolean (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
-			return val;
-		}
-
-		public bool get_boolean_by_raw_key (NSObject key) throws Error {
-			bool val;
-			if (!get_optional_boolean_by_raw_key (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
-			return val;
-		}
-
-		public bool get_optional_boolean (string key, out bool val) throws Error {
-			return get_optional_boolean_by_raw_key (new NSString (key), out val);
-		}
-
-		public bool get_optional_boolean_by_raw_key (NSObject key, out bool val) throws Error {
-			val = false;
-
-			NSObject? opaque_obj = storage[key];
-			if (opaque_obj == null)
-				return false;
-
-			NSNumber? number_obj = opaque_obj as NSNumber;
-			if (number_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
-					key.to_string (), Type.from_instance (opaque_obj).name ());
-			}
-
-			val = number_obj.boolean;
-			return true;
-		}
-
-		public int64 get_integer (string key) throws Error {
-			int64 val;
-			if (!get_optional_integer (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
-			return val;
-		}
-
-		public int64 get_integer_by_raw_key (NSObject key) throws Error {
-			int64 val;
-			if (!get_optional_integer_by_raw_key (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
-			return val;
-		}
-
-		public bool get_optional_integer (string key, out int64 val) throws Error {
-			return get_optional_integer_by_raw_key (new NSString (key), out val);
-		}
-
-		public bool get_optional_integer_by_raw_key (NSObject key, out int64 val) throws Error {
-			val = -1;
-
-			NSObject? opaque_obj = storage[key];
-			if (opaque_obj == null)
-				return false;
-
-			NSNumber? number_obj = opaque_obj as NSNumber;
-			if (number_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
-					key.to_string (), Type.from_instance (opaque_obj).name ());
-			}
-
-			val = number_obj.integer;
-			return true;
-		}
-
-		public void set_integer (string key, int64 val) {
-			storage[new NSString (key)] = new NSNumber.from_integer (val);
-		}
-
-		public unowned string get_string (string key) throws Error {
-			unowned string val;
-			if (!get_optional_string (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
-			return val;
-		}
-
-		public unowned string get_string_by_raw_key (NSObject key) throws Error {
-			unowned string val;
-			if (!get_optional_string_by_raw_key (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
-			return val;
-		}
-
-		public bool get_optional_string (string key, out unowned string? val) throws Error {
-			return get_optional_string_by_raw_key (new NSString (key), out val);
-		}
-
-		public bool get_optional_string_by_raw_key (NSObject key, out unowned string? val) throws Error {
-			val = null;
-
-			NSObject? opaque_obj = storage[key];
-			if (opaque_obj == null)
-				return false;
-
-			NSString? str_obj = opaque_obj as NSString;
-			if (str_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
-					key.to_string (), Type.from_instance (opaque_obj).name ());
-			}
-
-			val = str_obj.str;
-			return true;
+		public NSDictionaryRaw (Gee.HashMap<NSObject, NSObject>? storage = null) {
+			this.storage = (storage != null)
+				? storage
+				: new Gee.HashMap<NSObject, NSObject> (NSObject.hash_func, NSObject.equal_func);
 		}
 	}
 
@@ -1025,7 +1053,7 @@ namespace Frida.Fruity {
 		private Gee.ArrayList<NSObject> storage;
 
 		public NSArray (Gee.ArrayList<NSObject>? storage = null) {
-			this.storage = (storage != null) ? storage : new Gee.ArrayList<NSObject> (NSObject.equal);
+			this.storage = (storage != null) ? storage : new Gee.ArrayList<NSObject> (NSObject.equal_func);
 		}
 	}
 
@@ -1223,7 +1251,7 @@ namespace Frida.Fruity {
 			var keys = new PlistArray ();
 			var objs = new PlistArray ();
 			foreach (var entry in dict.entries) {
-				var key = encode_value (entry.key, ctx);
+				var key = encode_value (new NSString (entry.key), ctx);
 				var obj = encode_value (entry.value, ctx);
 
 				keys.add_uid (key);
@@ -1240,23 +1268,42 @@ namespace Frida.Fruity {
 			var keys = instance.get_array ("NS.keys");
 			var objs = instance.get_array ("NS.objects");
 
-			var storage = new Gee.HashMap<NSObject, NSObject> (NSObject.hash, NSObject.equal);
+			int n = keys.length;
 
-			var n = keys.length;
+			var string_keys = new Gee.ArrayList<string> ();
 			for (int i = 0; i != n; i++) {
-				var key = decode_value (keys.get_uid (i), ctx);
-				var obj = decode_value (objs.get_uid (i), ctx);
-
-				storage[key] = obj;
+				var key = decode_value (keys.get_uid (i), ctx) as NSString;
+				if (key is NSString)
+					string_keys.add (key.str);
+				else
+					break;
 			}
 
-			return new NSDictionary (storage);
+			if (string_keys.size == n) {
+				var storage = new Gee.HashMap<string, NSObject> ();
+
+				for (int i = 0; i != n; i++)
+					storage[string_keys[i]] = decode_value (objs.get_uid (i), ctx);
+
+				return new NSDictionary (storage);
+			} else {
+				var storage = new Gee.HashMap<NSObject, NSObject> (NSObject.hash_func, NSObject.equal_func);
+
+				for (int i = 0; i != n; i++) {
+					var key = decode_value (keys.get_uid (i), ctx);
+					var obj = decode_value (objs.get_uid (i), ctx);
+
+					storage[key] = obj;
+				}
+
+				return new NSDictionaryRaw (storage);
+			}
 		}
 
 		private static NSObject decode_array (PlistDict instance, DecodingContext ctx) throws Error, PlistError {
 			var objs = instance.get_array ("NS.objects");
 
-			var storage = new Gee.ArrayList<NSObject> (NSObject.equal);
+			var storage = new Gee.ArrayList<NSObject> (NSObject.equal_func);
 
 			var n = objs.length;
 			for (int i = 0; i != n; i++) {
