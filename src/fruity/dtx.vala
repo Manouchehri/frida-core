@@ -233,7 +233,7 @@ namespace Frida.Fruity {
 			process_incoming_fragments.begin ();
 		}
 
-		internal async void close (Cancellable? cancellable) throws IOError {
+		private async void close (Cancellable? cancellable) throws IOError {
 			io_cancellable.cancel ();
 
 			var source = new IdleSource ();
@@ -245,8 +245,6 @@ namespace Frida.Fruity {
 				yield stream.close_async (Priority.DEFAULT, cancellable);
 			} catch (IOError e) {
 			}
-
-			printerr ("close() finished\n");
 		}
 
 		public DTXChannel make_channel (string identifier) throws Error {
