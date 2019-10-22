@@ -1,5 +1,5 @@
 namespace Frida.Fruity {
-	private class NSObject {
+	public class NSObject {
 		public virtual uint hash () {
 			return (uint) this;
 		}
@@ -21,7 +21,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class NSNumber : NSObject {
+	public class NSNumber : NSObject {
 		public bool boolean {
 			get;
 			private set;
@@ -58,7 +58,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class NSString : NSObject {
+	public class NSString : NSObject {
 		public string str {
 			get;
 			private set;
@@ -84,7 +84,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class NSDictionary : NSObject {
+	public class NSDictionary : NSObject {
 		public int size {
 			get {
 				return storage.size;
@@ -115,84 +115,37 @@ namespace Frida.Fruity {
 			this.storage = (storage != null) ? storage : new Gee.HashMap<string, NSObject> ();
 		}
 
-		public bool get_boolean (string key) throws Error {
-			bool val;
-			if (!get_optional_boolean (key, out val))
+		public unowned T get_value<T> (string key) throws Error {
+			unowned T? val;
+			if (!get_optional_value<T> (key, out val))
 				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
 			return val;
 		}
 
-		public bool get_optional_boolean (string key, out bool val) throws Error {
-			val = false;
-
-			NSObject? opaque_obj = storage[key];
-			if (opaque_obj == null)
-				return false;
-
-			NSNumber? number_obj = opaque_obj as NSNumber;
-			if (number_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
-					key.to_string (), Type.from_instance (opaque_obj).name ());
-			}
-
-			val = number_obj.boolean;
-			return true;
-		}
-
-		public int64 get_integer (string key) throws Error {
-			int64 val;
-			if (!get_optional_integer (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
-			return val;
-		}
-
-		public bool get_optional_integer (string key, out int64 val) throws Error {
-			val = -1;
-
-			NSObject? opaque_obj = storage[key];
-			if (opaque_obj == null)
-				return false;
-
-			NSNumber? number_obj = opaque_obj as NSNumber;
-			if (number_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
-					key.to_string (), Type.from_instance (opaque_obj).name ());
-			}
-
-			val = number_obj.integer;
-			return true;
-		}
-
-		public void set_integer (string key, int64 val) {
-			storage[key] = new NSNumber.from_integer (val);
-		}
-
-		public unowned string get_string (string key) throws Error {
-			unowned string val;
-			if (!get_optional_string (key, out val))
-				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
-			return val;
-		}
-
-		public bool get_optional_string (string key, out unowned string? val) throws Error {
+		public bool get_optional_value<T> (string key, out unowned T? val) throws Error {
 			val = null;
 
 			NSObject? opaque_obj = storage[key];
 			if (opaque_obj == null)
 				return false;
 
-			NSString? str_obj = opaque_obj as NSString;
-			if (str_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
-					key.to_string (), Type.from_instance (opaque_obj).name ());
+			Type expected_type = typeof (T);
+			Type actual_type = Type.from_instance (opaque_obj);
+			if (!actual_type.is_a (expected_type)) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a %s but got %s",
+					key, expected_type.name (), actual_type.name ());
 			}
 
-			val = str_obj.str;
+			val = (T) opaque_obj;
 			return true;
+		}
+
+		public void set_value (string key, NSObject val) {
+			storage[key] = val;
 		}
 	}
 
-	private class NSDictionaryRaw : NSObject {
+	public class NSDictionaryRaw : NSObject {
 		public int size {
 			get {
 				return storage.size;
@@ -226,7 +179,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class NSArray : NSObject {
+	public class NSArray : NSObject {
 		public int length {
 			get {
 				return storage.size;
@@ -246,18 +199,32 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class NSDate : NSObject {
+	public class NSDate : NSObject {
 		public double time {
 			get;
 			private set;
 		}
 
+		private const uint64 MAC_EPOCH_DELTA_FROM_UNIX = 978307200ULL;
+
 		public NSDate (double time) {
 			this.time = time;
 		}
+
+		public DateTime to_date_time () {
+			uint64 seconds_uint = (uint64) time;
+			double seconds_real = (double) seconds_uint;
+
+			long sec = (long) (MAC_EPOCH_DELTA_FROM_UNIX + seconds_uint);
+			long usec = (long) ((time - seconds_real) * 1000000.0);
+
+			TimeVal tv = { sec, usec };
+
+			return new DateTime.from_timeval_utc (tv);
+		}
 	}
 
-	private class NSError : NSObject {
+	public class NSError : NSObject {
 		public NSString domain {
 			get;
 			private set;
@@ -292,7 +259,7 @@ namespace Frida.Fruity {
 		[CCode (has_target = false)]
 		private delegate NSObject DecodeFunc (PlistDict instance, DecodingContext ctx) throws Error, PlistError;
 
-		private static uint8[] encode (NSObject? obj) {
+		public static uint8[] encode (NSObject? obj) {
 			if (obj == null)
 				return new uint8[0];
 
@@ -327,7 +294,7 @@ namespace Frida.Fruity {
 			return encode_object (obj, ctx);
 		}
 
-		private static NSObject? decode (uint8[] data) throws Error {
+		public static NSObject? decode (uint8[] data) throws Error {
 			ensure_decoders_registered ();
 
 			try {

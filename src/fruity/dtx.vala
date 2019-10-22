@@ -46,10 +46,6 @@ namespace Frida.Fruity {
 			if (processes == null)
 				throw new Error.PROTOCOL ("Malformed response");
 
-			printerr ("Got %u processes\n", processes.length);
-
-			var start_date_key = new NSString ("startDate");
-
 			foreach (var element in processes.elements) {
 				NSDictionary? process = element as NSDictionary;
 				if (process == null)
@@ -57,18 +53,18 @@ namespace Frida.Fruity {
 
 				var info = new ProcessInfo ();
 
-				info.pid = (uint) process.get_integer ("pid");
+				info.pid = (uint) process.get_value<NSNumber> ("pid").integer;
 
-				info.name = process.get_string ("name");
-				info.real_app_name = process.get_string ("realAppName");
+				info.name = process.get_value<NSString> ("name").str;
+				info.real_app_name = process.get_value<NSString> ("realAppName").str;
 
-				bool foreground_running;
-				if (process.get_optional_boolean ("foregroundRunning", out foreground_running))
-					info.foreground_running = foreground_running;
+				NSNumber? foreground_running;
+				if (process.get_optional_value ("foregroundRunning", out foreground_running))
+					info.foreground_running = foreground_running.boolean;
 
-				// info.start_date = process.get_date ("startDate");
-
-				printerr ("name: \"%s\" pid=%u\n", info.name, info.pid);
+				NSDate? start_date;
+				if (process.get_optional_value ("startDate", out start_date))
+					info.start_date = start_date.to_date_time ();
 
 				result.add (info);
 			}
@@ -104,7 +100,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class DTXConnection : Object, DTXTransport {
+	public class DTXConnection : Object, DTXTransport {
 		public IOStream stream {
 			get;
 			construct;
@@ -200,8 +196,8 @@ namespace Frida.Fruity {
 			var control_channel = channels[CONTROL_CHANNEL_CODE];
 
 			var capabilities = new NSDictionary ();
-			capabilities.set_integer ("com.apple.private.DTXConnection", 1);
-			capabilities.set_integer ("com.apple.private.DTXBlockCompression", 2);
+			capabilities.set_value ("com.apple.private.DTXConnection", new NSNumber.from_integer (1));
+			capabilities.set_value ("com.apple.private.DTXBlockCompression", new NSNumber.from_integer (2));
 
 			var args = new DTXArgumentListBuilder ()
 				.append_object (capabilities);
@@ -216,9 +212,7 @@ namespace Frida.Fruity {
 				.append_object (new NSString (identifier));
 			try {
 				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
-				printerr ("w00t!\n");
 			} catch (GLib.Error e) {
-				printerr ("Oopsie: %s\n", e.message);
 				channels.unset (channel.code);
 			}
 		}
@@ -288,7 +282,6 @@ namespace Frida.Fruity {
 						process_message (message, first_fragment);
 					}
 				} catch (GLib.Error e) {
-					printerr ("DERP: %s\n", e.message);
 					return;
 				}
 			}
@@ -384,10 +377,8 @@ namespace Frida.Fruity {
 			}
 
 			var channel = channels[channel_code];
-			if (channel == null) {
-				printerr ("Got a message for an unknown channel with channel_code=%d\n", message.channel_code);
+			if (channel == null)
 				return;
-			}
 
 			switch (message.type) {
 				case INVOKE:
@@ -505,7 +496,8 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class DTXChannel : Object {
+	public class DTXChannel : Object {
+		public signal void invocation (string method_name, DTXArgumentList args, DTXMessageTransportFlags transport_flags);
 		public signal void notification (NSDictionary dict);
 		public signal void barrier ();
 
@@ -546,7 +538,6 @@ namespace Frida.Fruity {
 
 			uint32 identifier;
 			transport.send_message (message, out identifier);
-			printerr ("[DTXChannel %d] invoke() %s, identifier=%u\n", code, method_name, identifier);
 
 			var request = new Promise<NSObject?> ();
 			pending_responses[identifier] = request;
@@ -575,7 +566,6 @@ namespace Frida.Fruity {
 
 			uint32 identifier;
 			transport.send_message (message, out identifier);
-			printerr ("[DTXChannel %d] invoke_without_reply() %s\n", code, method_name);
 		}
 
 		internal void handle_invoke (DTXMessage message) throws Error {
@@ -583,14 +573,12 @@ namespace Frida.Fruity {
 			if (method_name == null)
 				throw new Error.PROTOCOL ("Malformed invocation payload");
 
-			printerr ("[DTXChannel %d] INVOKE: %s\n", code, method_name.str);
+			var args = DTXArgumentList.parse (message.aux_data);
 
-			// var args = DTXArgumentList.parse (message.aux_data);
+			invocation (method_name.str, args, message.transport_flags);
 		}
 
 		internal void handle_response (DTXMessage message) throws Error {
-			printerr ("[DTXChannel %d] RESPONSE type=%s identifier=%u\n", code, message.type.to_string (), message.identifier);
-
 			var request = pending_responses[message.identifier];
 			if (request != null) {
 				switch (message.type) {
@@ -609,9 +597,9 @@ namespace Frida.Fruity {
 
 						var user_info = error.user_info;
 						if (user_info != null) {
-							string str;
-							if (user_info.get_optional_string ("NSLocalizedDescription", out str))
-								description.append (str);
+							NSString? val;
+							if (user_info.get_optional_value ("NSLocalizedDescription", out val))
+								description.append (val.str);
 						}
 
 						if (description.len == 0) {
@@ -629,7 +617,6 @@ namespace Frida.Fruity {
 		}
 
 		internal void handle_notification (DTXMessage message) throws Error {
-			printerr ("[DTXChannel %d] NOTIFICATION\n", code);
 			NSDictionary? dict = NSKeyedArchive.decode (message.payload_data) as NSDictionary;
 			if (dict == null)
 				throw new Error.PROTOCOL ("Malformed notification payload");
@@ -637,16 +624,15 @@ namespace Frida.Fruity {
 		}
 
 		internal void handle_barrier (DTXMessage message) throws Error {
-			printerr ("[DTXChannel %d] BARRIER\n", code);
 			barrier ();
 		}
 	}
 
-	private interface DTXTransport : Object {
+	public interface DTXTransport : Object {
 		public abstract void send_message (DTXMessage message, out uint32 identifier);
 	}
 
-	private enum DTXMessageType {
+	public enum DTXMessageType {
 		OK = 0,
 		INVOKE = 2,
 		RESULT = 3,
@@ -654,7 +640,7 @@ namespace Frida.Fruity {
 		BARRIER = 5
 	}
 
-	private struct DTXMessage {
+	public struct DTXMessage {
 		public DTXMessageType type;
 		public uint32 identifier;
 		public uint32 conversation_index;
@@ -670,7 +656,7 @@ namespace Frida.Fruity {
 		EXPECTS_REPLY = (1 << 0),
 	}
 
-	private class DTXArgumentList {
+	public class DTXArgumentList {
 		private Value[] elements;
 
 		private DTXArgumentList (owned Value[] elements) {
@@ -755,7 +741,7 @@ namespace Frida.Fruity {
 		}
 	}
 
-	private class DTXArgumentListBuilder {
+	public class DTXArgumentListBuilder {
 		private PrimitiveBuilder blob = new PrimitiveBuilder ();
 
 		public DTXArgumentListBuilder () {
