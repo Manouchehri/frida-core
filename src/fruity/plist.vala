@@ -602,8 +602,14 @@ namespace Frida.Fruity {
 					return;
 				}
 
-				output.put_byte (0x13);
-				output.put_int64 (val);
+				if (val < 0) {
+					output.put_byte (0x13);
+					output.put_int64 (val);
+					return;
+				}
+
+				output.put_byte (0x14);
+				output.put_uint64 (val);
 			}
 
 			private void write_float (float val) throws IOError {
@@ -621,7 +627,7 @@ namespace Frida.Fruity {
 			}
 
 			private void write_date (PlistDate date) throws IOError {
-				output.put_byte (0x30);
+				output.put_byte (0x33);
 
 				var val = date.get_time ();
 				double point_in_time = (double) (val.tv_sec - EPOCH) + ((double) val.tv_usec * 1000000.0);
@@ -656,9 +662,9 @@ namespace Frida.Fruity {
 					for (long i = 0; i != num_chars; i++)
 						chars[i] = chars[i].to_big_endian ();
 
-					size_t size = num_chars * sizeof (uint16);
-					write_size_header (0x6, size);
+					write_size_header (0x6, num_chars);
 
+					size_t size = num_chars * sizeof (uint16);
 					unowned uint8[] data = ((uint8[]) chars)[0:size];
 					size_t bytes_written;
 					output.write_all (data, out bytes_written);
@@ -666,7 +672,7 @@ namespace Frida.Fruity {
 			}
 
 			private void write_uid (PlistUid val) throws IOError {
-				output.put_byte (0x30 | (object_ref_size - 1));
+				output.put_byte (0x80 | (object_ref_size - 1));
 
 				write_ref ((uint) val.uid);
 			}
