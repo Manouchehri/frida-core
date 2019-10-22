@@ -460,9 +460,14 @@ namespace Frida {
 			var result = new HostProcessInfo[processes.size];
 			int i = 0;
 			foreach (var process in processes) {
-				result[i] = HostProcessInfo (process.pid, process.name, no_icon, no_icon);
+				var pid = process.pid;
+				if (pid == 0)
+					continue;
+				result[i] = HostProcessInfo (pid, process.name, no_icon, no_icon);
 				i++;
 			}
+			if (i < processes.size)
+				result.resize (i);
 
 			if (server != null && server.flavor == GADGET) {
 				foreach (var process in yield server.session.enumerate_processes (cancellable))
