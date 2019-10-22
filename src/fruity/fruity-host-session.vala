@@ -219,6 +219,8 @@ namespace Frida {
 		}
 
 		public async void close (Cancellable? cancellable) throws IOError {
+			yield Fruity.DTXConnection.close_all (this, cancellable);
+
 			if (lockdown_client_request != null) {
 				Fruity.LockdownClient? lockdown = null;
 				try {

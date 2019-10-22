@@ -173,6 +173,27 @@ namespace Frida.Fruity {
 			}
 		}
 
+		public static async void close_all (ChannelProvider channel_provider, Cancellable? cancellable) throws IOError {
+			if (connections == null)
+				return;
+
+			while (connections.has_key (channel_provider)) {
+				var future = connections[channel_provider];
+				try {
+					var connection = yield future.wait_async (cancellable);
+					connections.unset (channel_provider);
+					yield connection.close (cancellable);
+				} catch (Error e) {
+					continue;
+				} catch (IOError e) {
+					cancellable.set_error_if_cancelled ();
+				}
+			}
+
+			if (connections.size == 0)
+				connections = null;
+		}
+
 		private static void on_connection_state_changed (Object object, ParamSpec pspec) {
 			DTXConnection connection = (DTXConnection) object;
 			if (connection.state != CLOSED)
@@ -210,6 +231,22 @@ namespace Frida.Fruity {
 			}
 
 			process_incoming_fragments.begin ();
+		}
+
+		internal async void close (Cancellable? cancellable) throws IOError {
+			io_cancellable.cancel ();
+
+			var source = new IdleSource ();
+			source.set_callback (close.callback);
+			source.attach (MainContext.get_thread_default ());
+			yield;
+
+			try {
+				yield stream.close_async (Priority.DEFAULT, cancellable);
+			} catch (IOError e) {
+			}
+
+			printerr ("close() finished\n");
 		}
 
 		public DTXChannel make_channel (string identifier) throws Error {
@@ -515,7 +552,7 @@ namespace Frida.Fruity {
 		}
 
 		private void check_open () throws Error {
-			if (state != OPEN)
+			if (_state != OPEN)
 				throw new Error.INVALID_OPERATION ("Connection is closed");
 		}
 
@@ -721,7 +758,7 @@ namespace Frida.Fruity {
 		}
 
 		private void check_open () throws Error {
-			if (state != OPEN)
+			if (_state != OPEN)
 				throw new Error.INVALID_OPERATION ("Channel is closed");
 		}
 	}
