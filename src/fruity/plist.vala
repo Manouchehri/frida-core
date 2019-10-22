@@ -1215,6 +1215,26 @@ namespace Frida.Fruity {
 			set_raw_value (key, gval);
 		}
 
+		public float get_float (string key) throws PlistError {
+			return get_value (key, typeof (float)).get_float ();
+		}
+
+		public void set_float (string key, float val) {
+			var gval = make_value (typeof (float));
+			gval.set_float (val);
+			set_raw_value (key, gval);
+		}
+
+		public double get_double (string key) throws PlistError {
+			return get_value (key, typeof (double)).get_double ();
+		}
+
+		public void set_double (string key, double val) {
+			var gval = make_value (typeof (double));
+			gval.set_double (val);
+			set_raw_value (key, gval);
+		}
+
 		public unowned string get_string (string key) throws PlistError {
 			return get_value (key, typeof (string)).get_string ();
 		}
@@ -1355,6 +1375,26 @@ namespace Frida.Fruity {
 		public void add_integer (int64 val) {
 			var gval = make_value (typeof (int64));
 			gval.set_int64 (val);
+			storage.add (gval);
+		}
+
+		public float get_float (int index) throws PlistError {
+			return get_value (index, typeof (float)).get_float ();
+		}
+
+		public void add_float (float val) {
+			var gval = make_value (typeof (float));
+			gval.set_float (val);
+			storage.add (gval);
+		}
+
+		public double get_double (int index) throws PlistError {
+			return get_value (index, typeof (double)).get_double ();
+		}
+
+		public void add_double (double val) {
+			var gval = make_value (typeof (double));
+			gval.set_double (val);
 			storage.add (gval);
 		}
 
