@@ -723,13 +723,16 @@ namespace Frida.Fruity {
 
 		public unowned DTXArgumentListBuilder append_string (string str) {
 			begin_entry (STRING)
+				.append_uint32 (str.length)
 				.append_string (str);
 			return this;
 		}
 
 		public unowned DTXArgumentListBuilder append_object (NSObject? obj) {
+			var buf = NSKeyedArchive.encode (obj);
 			begin_entry (BUFFER)
-				.append_byte_array (NSKeyedArchive.encode (obj));
+				.append_uint32 (buf.length)
+				.append_byte_array (buf);
 			return this;
 		}
 
