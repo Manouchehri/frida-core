@@ -32,7 +32,7 @@ namespace Frida.Fruity {
 			return true;
 		}
 
-		public async Gee.ArrayList<ProcessInfo> enumerate_running_processes (Cancellable? cancellable = null)
+		public async Gee.ArrayList<ProcessInfo> enumerate_processes (Cancellable? cancellable = null)
 				throws Error, IOError {
 			var result = new Gee.ArrayList<ProcessInfo> ();
 

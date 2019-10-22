@@ -69,7 +69,7 @@ namespace Frida.Fruity {
 			}
 		}
 
-		public async Gee.HashMap<string, ApplicationDetails> lookup (string[] identifiers, Cancellable? cancellable = null) throws InstallationProxyError, IOError {
+		public async Gee.HashMap<string, ApplicationDetails> lookup (PlistDict query, Cancellable? cancellable = null) throws InstallationProxyError, IOError {
 			try {
 				var result = new Gee.HashMap<string, ApplicationDetails> ();
 
@@ -77,10 +77,12 @@ namespace Frida.Fruity {
 
 				var options = make_client_options ();
 				request.set_dict ("ClientOptions", options);
-				var ids = new PlistArray ();
-				options.set_array ("BundleIDs", ids);
-				foreach (var bundle_id in identifiers)
-					ids.add_string (bundle_id);
+				foreach (var key in query.keys) {
+					var val = query.get_value (key);
+					Value? val_copy = Value (val.type ());
+					val.copy (ref val_copy);
+					options.set_value (key, (owned) val_copy);
+				}
 
 				var reader = yield service.begin_query (request, cancellable);
 				string status = "";
@@ -100,11 +102,6 @@ namespace Frida.Fruity {
 			} catch (PlistError e) {
 				throw error_from_plist (e);
 			}
-		}
-
-		public async ApplicationDetails? lookup_one (string identifier, Cancellable? cancellable = null) throws InstallationProxyError, IOError {
-			var matches = yield lookup ({ identifier }, cancellable);
-			return matches[identifier];
 		}
 
 		private static Plist make_request (string command) {

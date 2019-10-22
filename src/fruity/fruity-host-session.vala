@@ -372,6 +372,7 @@ namespace Frida {
 		private const uint16 DEFAULT_SERVER_PORT = 27042;
 		private const string GADGET_APP_ID = "re.frida.Gadget";
 		private const string DEBUGSERVER_SERVICE_NAME = "com.apple.debugserver";
+		private const string SPRINGBOARD_PATH = "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
 
 		public FruityHostSession (ChannelProvider channel_provider, FruityLockdownProvider lockdown_provider) {
 			Object (
@@ -408,15 +409,53 @@ namespace Frida {
 			io_cancellable.cancel ();
 		}
 
-		public async HostApplicationInfo get_frontmost_application (Cancellable? cancellable) throws GLib.Error {
-			var server = yield get_remote_server (cancellable);
-			return yield server.session.get_frontmost_application (cancellable);
+		public async HostApplicationInfo get_frontmost_application (Cancellable? cancellable) throws Error, IOError {
+			var server = yield try_get_remote_server (cancellable);
+			if (server != null && server.flavor == REGULAR) {
+				try {
+					return yield server.session.get_frontmost_application (cancellable);
+				} catch (GLib.Error e) {
+					throw_api_error (e);
+				}
+			}
+
+			var device_info = yield Fruity.DeviceInfoService.open (channel_provider, cancellable);
+
+			var processes = yield device_info.enumerate_processes (cancellable);
+
+			var no_icon = ImageData (0, 0, 0, "");
+
+			var p = processes.first_match (p => p.foreground_running && p.real_app_name != SPRINGBOARD_PATH);
+			if (p == null)
+				return HostApplicationInfo ("", "", 0, no_icon, no_icon);
+
+			/*
+			var installation_proxy = yield Fruity.InstallationProxyClient.open (lockdown, cancellable);
+
+			var query = new Fruity.PlistDict ();
+			var ids = new Fruity.PlistArray ();
+			ids.add_string (program);
+			query.set_array ("BundleIDs", ids);
+
+			var matches = yield installation_proxy.lookup (query, cancellable);
+			var app = matches[program];
+			if (app == null)
+				throw new Error.INVALID_ARGUMENT ("Unable to find app with bundle identifier “%s”", program);
+			*/
+
+			printerr ("Found: %s %s\n", p.name, p.real_app_name);
+			return HostApplicationInfo ("", "", 0, no_icon, no_icon);
 		}
 
-		public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws GLib.Error {
+		public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws Error, IOError {
 			var server = yield try_get_remote_server (cancellable);
-			if (server != null && server.flavor == REGULAR)
-				return yield server.session.enumerate_applications (cancellable);
+			if (server != null && server.flavor == REGULAR) {
+				try {
+					return yield server.session.enumerate_applications (cancellable);
+				} catch (GLib.Error e) {
+					throw_api_error (e);
+				}
+			}
 
 			try {
 				var lockdown = yield lockdown_provider.get_lockdown_client (cancellable);
@@ -436,8 +475,11 @@ namespace Frida {
 				}
 
 				if (server != null && server.flavor == GADGET) {
-					foreach (var app in yield server.session.enumerate_applications (cancellable))
-						result += app;
+					try {
+						foreach (var app in yield server.session.enumerate_applications (cancellable))
+							result += app;
+					} catch (GLib.Error e) {
+					}
 				}
 
 				return result;
@@ -446,14 +488,19 @@ namespace Frida {
 			}
 		}
 
-		public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws GLib.Error {
+		public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws Error, IOError {
 			var server = yield try_get_remote_server (cancellable);
-			if (server != null && server.flavor == REGULAR)
-				return yield server.session.enumerate_processes (cancellable);
+			if (server != null && server.flavor == REGULAR) {
+				try {
+					return yield server.session.enumerate_processes (cancellable);
+				} catch (GLib.Error e) {
+					throw_api_error (e);
+				}
+			}
 
 			var device_info = yield Fruity.DeviceInfoService.open (channel_provider, cancellable);
 
-			var processes = yield device_info.enumerate_running_processes (cancellable);
+			var processes = yield device_info.enumerate_processes (cancellable);
 
 			var no_icon = ImageData (0, 0, 0, "");
 
@@ -470,37 +517,61 @@ namespace Frida {
 				result.resize (i);
 
 			if (server != null && server.flavor == GADGET) {
-				foreach (var process in yield server.session.enumerate_processes (cancellable))
-					result += process;
+				try {
+					foreach (var process in yield server.session.enumerate_processes (cancellable))
+						result += process;
+				} catch (GLib.Error e) {
+				}
 			}
 
 			return result;
 		}
 
-		public async void enable_spawn_gating (Cancellable? cancellable) throws GLib.Error {
+		public async void enable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			yield server.session.enable_spawn_gating (cancellable);
+			try {
+				yield server.session.enable_spawn_gating (cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async void disable_spawn_gating (Cancellable? cancellable) throws GLib.Error {
+		public async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			yield server.session.disable_spawn_gating (cancellable);
+			try {
+				yield server.session.disable_spawn_gating (cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws GLib.Error {
+		public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			return yield server.session.enumerate_pending_spawn (cancellable);
+			try {
+				return yield server.session.enumerate_pending_spawn (cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async HostChildInfo[] enumerate_pending_children (Cancellable? cancellable) throws GLib.Error {
+		public async HostChildInfo[] enumerate_pending_children (Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			return yield server.session.enumerate_pending_children (cancellable);
+			try {
+				return yield server.session.enumerate_pending_children (cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable) throws GLib.Error {
+		public async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable) throws Error, IOError {
 			var server = yield try_get_remote_server (cancellable);
-			if (server != null && (server.flavor != GADGET || program == GADGET_APP_ID))
-				return yield server.session.spawn (program, options, cancellable);
+			if (server != null && (server.flavor != GADGET || program == GADGET_APP_ID)) {
+				try {
+					return yield server.session.spawn (program, options, cancellable);
+				} catch (GLib.Error e) {
+					throw_api_error (e);
+				}
+			}
 
 			if (program[0] == '/')
 				throw new Error.NOT_SUPPORTED ("Only able to spawn apps");
@@ -540,9 +611,15 @@ namespace Frida {
 
 				var installation_proxy = yield Fruity.InstallationProxyClient.open (lockdown, cancellable);
 
-				var app = yield installation_proxy.lookup_one (program, cancellable);
+				var query = new Fruity.PlistDict ();
+				var ids = new Fruity.PlistArray ();
+				ids.add_string (program);
+				query.set_array ("BundleIDs", ids);
+
+				var matches = yield installation_proxy.lookup (query, cancellable);
+				var app = matches[program];
 				if (app == null)
-					throw new Error.INVALID_ARGUMENT ("Unable to find app with bundle identifier '%s'", program);
+					throw new Error.INVALID_ARGUMENT ("Unable to find app with bundle identifier “%s”", program);
 
 				string[] argv = { app.path };
 				if (options.has_argv) {
@@ -576,19 +653,23 @@ namespace Frida {
 				throw new Error.NOT_SUPPORTED ("%s", e.message);
 			} catch (Fruity.LockdownError e) {
 				if (e is Fruity.LockdownError.INVALID_SERVICE)
-					throw new Error.NOT_SUPPORTED ("Developer Disk Image not mounted");
+					throw new Error.NOT_SUPPORTED ("A Developer Disk Image is not mounted");
 				throw new Error.NOT_SUPPORTED ("%s", e.message);
 			} catch (LLDB.Error e) {
 				throw new Error.NOT_SUPPORTED ("%s", e.message);
 			}
 		}
 
-		public async void input (uint pid, uint8[] data, Cancellable? cancellable) throws GLib.Error {
+		public async void input (uint pid, uint8[] data, Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			yield server.session.input (pid, data, cancellable);
+			try {
+				yield server.session.input (pid, data, cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async void resume (uint pid, Cancellable? cancellable) throws GLib.Error {
+		public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
 			var entry = spawn_entries[pid];
 			if (entry != null) {
 				yield entry.resume (cancellable);
@@ -596,10 +677,14 @@ namespace Frida {
 			}
 
 			var server = yield get_remote_server (cancellable);
-			yield server.session.resume (pid, cancellable);
+			try {
+				yield server.session.resume (pid, cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async void kill (uint pid, Cancellable? cancellable) throws GLib.Error {
+		public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
 			var spawn_entry = spawn_entries[pid];
 			if (spawn_entry != null) {
 				yield spawn_entry.kill (cancellable);
@@ -607,10 +692,14 @@ namespace Frida {
 			}
 
 			var server = yield get_remote_server (cancellable);
-			yield server.session.kill (pid, cancellable);
+			try {
+				yield server.session.kill (pid, cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
-		public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws GLib.Error {
+		public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {
 			var spawn_entry = spawn_entries[pid];
 			if (spawn_entry != null) {
 				var gadget_details = yield spawn_entry.query_gadget_details (cancellable);
@@ -644,7 +733,12 @@ namespace Frida {
 
 			var server = yield get_remote_server (cancellable);
 
-			var remote_session_id = yield server.session.attach_to (pid, cancellable);
+			AgentSessionId remote_session_id;
+			try {
+				remote_session_id = yield server.session.attach_to (pid, cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 			var local_session_id = AgentSessionId (next_agent_session_id++);
 
 			AgentSession agent_session;
@@ -669,15 +763,23 @@ namespace Frida {
 		}
 
 		public async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data,
-				Cancellable? cancellable) throws GLib.Error {
+				Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			return yield server.session.inject_library_file (pid, path, entrypoint, data, cancellable);
+			try {
+				return yield server.session.inject_library_file (pid, path, entrypoint, data, cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
 		public async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data,
-				Cancellable? cancellable) throws GLib.Error {
+				Cancellable? cancellable) throws Error, IOError {
 			var server = yield get_remote_server (cancellable);
-			return yield server.session.inject_library_blob (pid, blob, entrypoint, data, cancellable);
+			try {
+				return yield server.session.inject_library_blob (pid, blob, entrypoint, data, cancellable);
+			} catch (GLib.Error e) {
+				throw_api_error (e);
+			}
 		}
 
 		private void on_spawn_entry_closed (SpawnEntry entry) {
