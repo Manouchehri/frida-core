@@ -36,8 +36,31 @@ namespace Frida.Fruity {
 			yield channel.close (cancellable);
 		}
 
-		public async Gee.ArrayList<ProcessInfo> enumerate_running_processes (Cancellable? cancellable = null) throws IOError {
+		public async Gee.ArrayList<ProcessInfo> enumerate_running_processes (Cancellable? cancellable = null)
+				throws Error, IOError {
 			var result = new Gee.ArrayList<ProcessInfo> ();
+
+			var response = yield channel.invoke ("runningProcesses", null, cancellable);
+
+			NSArray? processes = response as NSArray;
+			if (processes == null)
+				throw new Error.PROTOCOL ("Malformed response");
+
+			printerr ("Got %u processes\n", processes.length);
+
+			var name_key = new NSString ("name");
+			var pid_key = new NSString ("pid");
+
+			foreach (var element in processes.elements) {
+				NSDictionary? process = element as NSDictionary;
+				if (process == null)
+					throw new Error.PROTOCOL ("Malformed response");
+
+				unowned string name = process.get_string_by_raw_key (name_key);
+				uint pid = (uint) process.get_integer_by_raw_key (pid_key);
+
+				printerr ("name: \"%s\" pid=%u\n", name, pid);
+			}
 
 			var timeout_source = new TimeoutSource (5000);
 			timeout_source.set_callback (enumerate_running_processes.callback);
@@ -152,12 +175,7 @@ namespace Frida.Fruity {
 			var control_channel = new DTXChannel (CONTROL_CHANNEL_CODE, this);
 			channels[CONTROL_CHANNEL_CODE] = control_channel;
 
-			var capabilities = new NSDictionary ();
-			capabilities.set_int64 ("com.apple.private.DTXConnection", 1);
-			capabilities.set_int64 ("com.apple.private.DTXBlockCompression", 2);
-			var args = new DTXArgumentListBuilder ()
-				.append_object (capabilities);
-			control_channel.invoke_without_reply ("_notifyOfPublishedCapabilities:", args);
+			send_capabilities ();
 
 			process_incoming_fragments.begin ();
 		}
@@ -171,6 +189,18 @@ namespace Frida.Fruity {
 			request_channel.begin (channel, identifier);
 
 			return channel;
+		}
+
+		private void send_capabilities () {
+			var control_channel = channels[CONTROL_CHANNEL_CODE];
+
+			var capabilities = new NSDictionary ();
+			capabilities.set_integer ("com.apple.private.DTXConnection", 1);
+			capabilities.set_integer ("com.apple.private.DTXBlockCompression", 2);
+
+			var args = new DTXArgumentListBuilder ()
+				.append_object (capabilities);
+			control_channel.invoke_without_reply ("_notifyOfPublishedCapabilities:", args);
 		}
 
 		private async void request_channel (DTXChannel channel, string identifier) {
@@ -493,15 +523,18 @@ namespace Frida.Fruity {
 		public async void close (Cancellable? cancellable = null) throws IOError {
 		}
 
-		public async NSObject? invoke (string method_name, DTXArgumentListBuilder args, Cancellable? cancellable)
+		public async NSObject? invoke (string method_name, DTXArgumentListBuilder? args, Cancellable? cancellable)
 				throws Error, IOError {
 			var message = DTXMessage ();
 			message.type = INVOKE;
 			message.channel_code = code;
 			message.transport_flags = EXPECTS_REPLY;
 
-			var aux_data = args.build ();
-			message.aux_data = aux_data.get_data ();
+			Bytes aux_data;
+			if (args != null) {
+				aux_data = args.build ();
+				message.aux_data = aux_data.get_data ();
+			}
 
 			var payload_data = NSKeyedArchive.encode (new NSString (method_name));
 			message.payload_data = payload_data;
@@ -520,14 +553,17 @@ namespace Frida.Fruity {
 			}
 		}
 
-		public void invoke_without_reply (string method_name, DTXArgumentListBuilder args) {
+		public void invoke_without_reply (string method_name, DTXArgumentListBuilder? args) {
 			var message = DTXMessage ();
 			message.type = INVOKE;
 			message.channel_code = code;
 			message.transport_flags = NONE;
 
-			var aux_data = args.build ();
-			message.aux_data = aux_data.get_data ();
+			Bytes aux_data;
+			if (args != null) {
+				aux_data = args.build ();
+				message.aux_data = aux_data.get_data ();
+			}
 
 			var payload_data = NSKeyedArchive.encode (new NSString (method_name));
 			message.payload_data = payload_data;
@@ -544,7 +580,7 @@ namespace Frida.Fruity {
 
 			printerr ("[DTXChannel %d] INVOKE: %s\n", code, method_name.str);
 
-			var args = DTXArgumentList.parse (message.aux_data);
+			// var args = DTXArgumentList.parse (message.aux_data);
 		}
 
 		internal void handle_response (DTXMessage message) throws Error {
@@ -770,6 +806,10 @@ namespace Frida.Fruity {
 	}
 
 	private class NSObject {
+		public virtual string to_string () {
+			return "NSObject";
+		}
+
 		public static uint hash (NSObject val) {
 			NSString? s = val as NSString;
 			if (s != null)
@@ -789,13 +829,24 @@ namespace Frida.Fruity {
 	}
 
 	private class NSNumber : NSObject {
-		public int64 val {
+		public bool boolean {
 			get;
 			private set;
 		}
 
-		public NSNumber (int64 val) {
-			this.val = val;
+		public int64 integer {
+			get;
+			private set;
+		}
+
+		public NSNumber.from_boolean (bool val) {
+			boolean = val;
+			integer = val ? 1 : 0;
+		}
+
+		public NSNumber.from_integer (int64 val) {
+			boolean = (val != 0) ? true : false;
+			integer = val;
 		}
 	}
 
@@ -838,36 +889,112 @@ namespace Frida.Fruity {
 		private Gee.HashMap<NSObject, NSObject> storage;
 
 		public NSDictionary (Gee.HashMap<NSObject, NSObject>? storage = null) {
-			this.storage = (storage != null) ? storage : new Gee.HashMap<NSObject, NSObject> ();
+			this.storage = (storage != null) ? storage : new Gee.HashMap<NSObject, NSObject> (NSObject.hash, NSObject.equal);
 		}
 
-		public string get_string (string key) throws Error {
-			string val;
+		public unowned string get_string (string key) throws Error {
+			unowned string val;
 			if (!get_optional_string (key, out val))
 				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
 			return val;
 		}
 
-		public bool get_optional_string (string key, out string? val) throws Error {
+		public unowned string get_string_by_raw_key (NSObject key) throws Error {
+			unowned string val;
+			if (!get_optional_string_by_raw_key (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
+			return val;
+		}
+
+		public bool get_optional_string (string key, out unowned string? val) throws Error {
+			return get_optional_string_by_raw_key (new NSString (key), out val);
+		}
+
+		public bool get_optional_string_by_raw_key (NSObject key, out unowned string? val) throws Error {
 			val = null;
 
-			NSObject? opaque_obj = storage[new NSString (key)];
-			if (opaque_obj == null) {
+			NSObject? opaque_obj = storage[key];
+			if (opaque_obj == null)
 				return false;
-			}
 
 			NSString? str_obj = opaque_obj as NSString;
 			if (str_obj == null) {
 				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
-					key, Type.from_instance (opaque_obj).name ());
+					key.to_string (), Type.from_instance (opaque_obj).name ());
 			}
 
 			val = str_obj.str;
 			return true;
 		}
 
-		public void set_int64 (string key, int64 val) {
-			storage[new NSString (key)] = new NSNumber (val);
+		public int64 get_integer (string key) throws Error {
+			int64 val;
+			if (!get_optional_integer (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
+			return val;
+		}
+
+		public int64 get_integer_by_raw_key (NSObject key) throws Error {
+			int64 val;
+			if (!get_optional_integer_by_raw_key (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
+			return val;
+		}
+
+		public bool get_optional_integer (string key, out int64 val) throws Error {
+			return get_optional_integer_by_raw_key (new NSString (key), out val);
+		}
+
+		public bool get_optional_integer_by_raw_key (NSObject key, out int64 val) throws Error {
+			val = -1;
+
+			NSObject? opaque_obj = storage[key];
+			if (opaque_obj == null)
+				return false;
+
+			NSNumber? number_obj = opaque_obj as NSNumber;
+			if (number_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
+					key.to_string (), Type.from_instance (opaque_obj).name ());
+			}
+
+			val = number_obj.integer;
+			return true;
+		}
+
+		public void set_integer (string key, int64 val) {
+			storage[new NSString (key)] = new NSNumber.from_integer (val);
+		}
+	}
+
+	private class NSArray : NSObject {
+		public int length {
+			get {
+				return storage.size;
+			}
+		}
+
+		public Gee.Iterable<NSObject> elements {
+			owned get {
+				return storage;
+			}
+		}
+
+		private Gee.ArrayList<NSObject> storage;
+
+		public NSArray (Gee.ArrayList<NSObject>? storage = null) {
+			this.storage = (storage != null) ? storage : new Gee.ArrayList<NSObject> (NSObject.equal);
+		}
+	}
+
+	private class NSDate : NSObject {
+		public double time {
+			get;
+			private set;
+		}
+
+		public NSDate (double time) {
+			this.time = time;
 		}
 	}
 
@@ -965,8 +1092,11 @@ namespace Frida.Fruity {
 			Value * val = objects.get_value ((int) uid);
 			Type t = val.type ();
 
+			if (t == typeof (bool))
+				return new NSNumber.from_boolean (val.get_boolean ());
+
 			if (t == typeof (int64))
-				return new NSNumber (val.get_int64 ());
+				return new NSNumber.from_integer (val.get_int64 ());
 
 			if (t == typeof (string))
 				return new NSString (val.get_string ());
@@ -1011,11 +1141,13 @@ namespace Frida.Fruity {
 
 			decoders = new Gee.HashMap<string, DecodeFunc> ();
 			decoders["NSDictionary"] = decode_dictionary;
+			decoders["NSArray"] = decode_array;
+			decoders["NSDate"] = decode_date;
 			decoders["NSError"] = decode_error;
 		}
 
 		private static PlistUid encode_number (NSObject instance, EncodingContext ctx) {
-			int64 val = ((NSNumber) instance).val;
+			int64 val = ((NSNumber) instance).integer;
 
 			var uid = ctx.find_existing_object (e => e.holds (typeof (int64)) && e.get_int64 () == val);
 			if (uid != null)
@@ -1077,6 +1209,27 @@ namespace Frida.Fruity {
 			}
 
 			return new NSDictionary (storage);
+		}
+
+		private static NSObject decode_array (PlistDict instance, DecodingContext ctx) throws Error, PlistError {
+			var objs = instance.get_array ("NS.objects");
+
+			var storage = new Gee.ArrayList<NSObject> (NSObject.equal);
+
+			var n = objs.length;
+			for (int i = 0; i != n; i++) {
+				var obj = decode_value (objs.get_uid (i), ctx);
+
+				storage.add (obj);
+			}
+
+			return new NSArray (storage);
+		}
+
+		private static NSObject decode_date (PlistDict instance, DecodingContext ctx) throws Error, PlistError {
+			var time = instance.get_double ("NS.time");
+
+			return new NSDate (time);
 		}
 
 		private static NSObject decode_error (PlistDict instance, DecodingContext ctx) throws Error, PlistError {
