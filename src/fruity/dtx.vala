@@ -50,23 +50,30 @@ namespace Frida.Fruity {
 
 			var name_key = new NSString ("name");
 			var pid_key = new NSString ("pid");
+			var real_app_name_key = new NSString ("realAppName");
+			var foreground_running_key = new NSString ("foregroundRunning");
+			var start_date_key = new NSString ("startDate");
 
 			foreach (var element in processes.elements) {
 				NSDictionary? process = element as NSDictionary;
 				if (process == null)
 					throw new Error.PROTOCOL ("Malformed response");
 
-				unowned string name = process.get_string_by_raw_key (name_key);
-				uint pid = (uint) process.get_integer_by_raw_key (pid_key);
+				var info = new ProcessInfo ();
 
-				printerr ("name: \"%s\" pid=%u\n", name, pid);
+				info.pid = (uint) process.get_integer_by_raw_key (pid_key);
+
+				info.name = process.get_string_by_raw_key (name_key);
+				info.real_app_name = process.get_string_by_raw_key (name_key);
+
+				bool foreground_running;
+				if (process.get_optional_boolean_by_raw_key (foreground_running_key, out foreground_running))
+					info.foreground_running = foreground_running;
+
+				printerr ("name: \"%s\" pid=%u\n", info.name, info.pid);
+
+				result.add (info);
 			}
-
-			var timeout_source = new TimeoutSource (5000);
-			timeout_source.set_callback (enumerate_running_processes.callback);
-			timeout_source.attach (MainContext.get_thread_default ());
-
-			yield;
 
 			return result;
 		}
@@ -892,38 +899,38 @@ namespace Frida.Fruity {
 			this.storage = (storage != null) ? storage : new Gee.HashMap<NSObject, NSObject> (NSObject.hash, NSObject.equal);
 		}
 
-		public unowned string get_string (string key) throws Error {
-			unowned string val;
-			if (!get_optional_string (key, out val))
+		public bool get_boolean (string key) throws Error {
+			bool val;
+			if (!get_optional_boolean (key, out val))
 				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
 			return val;
 		}
 
-		public unowned string get_string_by_raw_key (NSObject key) throws Error {
-			unowned string val;
-			if (!get_optional_string_by_raw_key (key, out val))
+		public bool get_boolean_by_raw_key (NSObject key) throws Error {
+			bool val;
+			if (!get_optional_boolean_by_raw_key (key, out val))
 				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
 			return val;
 		}
 
-		public bool get_optional_string (string key, out unowned string? val) throws Error {
-			return get_optional_string_by_raw_key (new NSString (key), out val);
+		public bool get_optional_boolean (string key, out bool val) throws Error {
+			return get_optional_boolean_by_raw_key (new NSString (key), out val);
 		}
 
-		public bool get_optional_string_by_raw_key (NSObject key, out unowned string? val) throws Error {
-			val = null;
+		public bool get_optional_boolean_by_raw_key (NSObject key, out bool val) throws Error {
+			val = false;
 
 			NSObject? opaque_obj = storage[key];
 			if (opaque_obj == null)
 				return false;
 
-			NSString? str_obj = opaque_obj as NSString;
-			if (str_obj == null) {
-				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
+			NSNumber? number_obj = opaque_obj as NSNumber;
+			if (number_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a number but got “%s”",
 					key.to_string (), Type.from_instance (opaque_obj).name ());
 			}
 
-			val = str_obj.str;
+			val = number_obj.boolean;
 			return true;
 		}
 
@@ -964,6 +971,41 @@ namespace Frida.Fruity {
 
 		public void set_integer (string key, int64 val) {
 			storage[new NSString (key)] = new NSNumber.from_integer (val);
+		}
+
+		public unowned string get_string (string key) throws Error {
+			unowned string val;
+			if (!get_optional_string (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key);
+			return val;
+		}
+
+		public unowned string get_string_by_raw_key (NSObject key) throws Error {
+			unowned string val;
+			if (!get_optional_string_by_raw_key (key, out val))
+				throw new Error.PROTOCOL ("Expected dictionary to contain “%s”", key.to_string ());
+			return val;
+		}
+
+		public bool get_optional_string (string key, out unowned string? val) throws Error {
+			return get_optional_string_by_raw_key (new NSString (key), out val);
+		}
+
+		public bool get_optional_string_by_raw_key (NSObject key, out unowned string? val) throws Error {
+			val = null;
+
+			NSObject? opaque_obj = storage[key];
+			if (opaque_obj == null)
+				return false;
+
+			NSString? str_obj = opaque_obj as NSString;
+			if (str_obj == null) {
+				throw new Error.PROTOCOL ("Expected “%s” to be a string but got “%s”",
+					key.to_string (), Type.from_instance (opaque_obj).name ());
+			}
+
+			val = str_obj.str;
+			return true;
 		}
 	}
 
