@@ -32,10 +32,6 @@ namespace Frida.Fruity {
 			return true;
 		}
 
-		public async void close (Cancellable? cancellable = null) throws IOError {
-			yield channel.close (cancellable);
-		}
-
 		public async Gee.ArrayList<ProcessInfo> enumerate_running_processes (Cancellable? cancellable = null)
 				throws Error, IOError {
 			var result = new Gee.ArrayList<ProcessInfo> ();
@@ -106,7 +102,20 @@ namespace Frida.Fruity {
 			construct;
 		}
 
+		public State state {
+			get {
+				return _state;
+			}
+		}
+
+		public enum State {
+			OPEN,
+			CLOSED
+		}
+
 		private static Gee.HashMap<ChannelProvider, Future<DTXConnection>> connections;
+
+		private State _state = OPEN;
 
 		private DataInputStream input;
 		private OutputStream output;
@@ -151,6 +160,7 @@ namespace Frida.Fruity {
 					cancellable);
 
 				var connection = new DTXConnection (stream);
+				connection.notify["state"].connect (on_connection_state_changed);
 
 				request.resolve (connection);
 
@@ -160,6 +170,24 @@ namespace Frida.Fruity {
 				connections.unset (channel_provider);
 
 				throw e;
+			}
+		}
+
+		private static void on_connection_state_changed (Object object, ParamSpec pspec) {
+			DTXConnection connection = (DTXConnection) object;
+			if (connection.state != CLOSED)
+				return;
+
+			foreach (var entry in connections.entries) {
+				var future = entry.value;
+
+				if (future.ready) {
+					DTXConnection c = future.value;
+					if (c == connection) {
+						connections.unset (entry.key);
+						return;
+					}
+				}
 			}
 		}
 
@@ -175,12 +203,18 @@ namespace Frida.Fruity {
 			control_channel = new DTXControlChannel (this);
 			channels[control_channel.code] = control_channel;
 
-			control_channel.notify_of_published_capabilities ();
+			try {
+				control_channel.notify_of_published_capabilities ();
+			} catch (Error e) {
+				assert_not_reached ();
+			}
 
 			process_incoming_fragments.begin ();
 		}
 
-		public DTXChannel make_channel (string identifier) {
+		public DTXChannel make_channel (string identifier) throws Error {
+			check_open ();
+
 			int32 channel_code = next_channel_code++;
 
 			var channel = new DTXChannel (channel_code, this);
@@ -271,6 +305,13 @@ namespace Frida.Fruity {
 						process_message (message, first_fragment);
 					}
 				} catch (GLib.Error e) {
+					_state = CLOSED;
+					notify_property ("state");
+
+					foreach (var channel in channels.values.to_array ())
+						channel.close ();
+					channels.clear ();
+
 					return;
 				}
 			}
@@ -473,6 +514,11 @@ namespace Frida.Fruity {
 			}
 		}
 
+		private void check_open () throws Error {
+			if (state != OPEN)
+				throw new Error.INVALID_OPERATION ("Connection is closed");
+		}
+
 		private class Fragment {
 			public uint16 index;
 			public uint16 count;
@@ -490,7 +536,7 @@ namespace Frida.Fruity {
 			Object (code: 0, transport: transport);
 		}
 
-		public void notify_of_published_capabilities () {
+		public void notify_of_published_capabilities () throws Error {
 			var capabilities = new NSDictionary ();
 			capabilities.set_value ("com.apple.private.DTXConnection", new NSNumber.from_integer (1));
 			capabilities.set_value ("com.apple.private.DTXBlockCompression", new NSNumber.from_integer (2));
@@ -529,6 +575,19 @@ namespace Frida.Fruity {
 			construct;
 		}
 
+		public State state {
+			get {
+				return _state;
+			}
+		}
+
+		public enum State {
+			OPEN,
+			CLOSED
+		}
+
+		private State _state = OPEN;
+
 		private Gee.HashMap<uint32, Promise<NSObject?>> pending_responses = new Gee.HashMap<uint32, Promise<NSObject?>> ();
 
 		public DTXChannel (int32 code, DTXTransport transport) {
@@ -541,11 +600,19 @@ namespace Frida.Fruity {
 			base.dispose ();
 		}
 
-		public async void close (Cancellable? cancellable = null) throws IOError {
+		internal void close () {
+			_state = CLOSED;
+			notify_property ("state");
+
+			var error = new Error.TRANSPORT ("Channel closed");
+			foreach (var request in pending_responses.values.to_array ())
+				request.reject (error);
 		}
 
 		public async NSObject? invoke (string method_name, DTXArgumentListBuilder? args, Cancellable? cancellable)
 				throws Error, IOError {
+			check_open ();
+
 			var message = DTXMessage ();
 			message.type = INVOKE;
 			message.channel_code = code;
@@ -573,7 +640,9 @@ namespace Frida.Fruity {
 			}
 		}
 
-		public void invoke_without_reply (string method_name, DTXArgumentListBuilder? args) {
+		public void invoke_without_reply (string method_name, DTXArgumentListBuilder? args) throws Error {
+			check_open ();
+
 			var message = DTXMessage ();
 			message.type = INVOKE;
 			message.channel_code = code;
@@ -649,6 +718,11 @@ namespace Frida.Fruity {
 
 		internal void handle_barrier (DTXMessage message) throws Error {
 			barrier ();
+		}
+
+		private void check_open () throws Error {
+			if (state != OPEN)
+				throw new Error.INVALID_OPERATION ("Channel is closed");
 		}
 	}
 
