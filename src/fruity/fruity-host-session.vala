@@ -425,26 +425,29 @@ namespace Frida {
 
 			var no_icon = ImageData (0, 0, 0, "");
 
-			var p = processes.first_match (p => p.foreground_running && p.real_app_name != SPRINGBOARD_PATH);
-			if (p == null)
+			var process = processes.first_match (p => p.foreground_running && p.real_app_name != SPRINGBOARD_PATH);
+			if (process == null)
 				return HostApplicationInfo ("", "", 0, no_icon, no_icon);
 
-			/*
-			var installation_proxy = yield Fruity.InstallationProxyClient.open (lockdown, cancellable);
+			string app_path = process.real_app_name;
+			if (app_path.has_prefix ("/var/containers"))
+				app_path = "/private" + app_path;
+			int dot_app_start = app_path.last_index_of (".app/");
+			if (dot_app_start != -1)
+				app_path = app_path[0:dot_app_start + 4];
 
-			var query = new Fruity.PlistDict ();
-			var ids = new Fruity.PlistArray ();
-			ids.add_string (program);
-			query.set_array ("BundleIDs", ids);
+			var lockdown = yield lockdown_provider.get_lockdown_client (cancellable);
 
-			var matches = yield installation_proxy.lookup (query, cancellable);
-			var app = matches[program];
-			if (app == null)
-				throw new Error.INVALID_ARGUMENT ("Unable to find app with bundle identifier “%s”", program);
-			*/
+			string identifier;
+			try {
+				var installation_proxy = yield Fruity.InstallationProxyClient.open (lockdown, cancellable);
 
-			printerr ("Found: %s %s\n", p.name, p.real_app_name);
-			return HostApplicationInfo ("", "", 0, no_icon, no_icon);
+				identifier = yield installation_proxy.resolve_id_from_path (app_path, cancellable);
+			} catch (Fruity.InstallationProxyError e) {
+				throw new Error.NOT_SUPPORTED ("%s", e.message);
+			}
+
+			return HostApplicationInfo (identifier, process.name, process.pid, no_icon, no_icon);
 		}
 
 		public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws Error, IOError {

@@ -39,7 +39,8 @@ namespace Frida.Fruity {
 			yield service.close (cancellable);
 		}
 
-		public async Gee.ArrayList<ApplicationDetails> browse (Cancellable? cancellable = null) throws InstallationProxyError, IOError {
+		public async Gee.ArrayList<ApplicationDetails> browse (Cancellable? cancellable = null)
+				throws InstallationProxyError, IOError {
 			try {
 				var result = new Gee.ArrayList<ApplicationDetails> ();
 
@@ -69,7 +70,8 @@ namespace Frida.Fruity {
 			}
 		}
 
-		public async Gee.HashMap<string, ApplicationDetails> lookup (PlistDict query, Cancellable? cancellable = null) throws InstallationProxyError, IOError {
+		public async Gee.HashMap<string, ApplicationDetails> lookup (PlistDict query, Cancellable? cancellable = null)
+				throws InstallationProxyError, IOError {
 			try {
 				var result = new Gee.HashMap<string, ApplicationDetails> ();
 
@@ -104,6 +106,48 @@ namespace Frida.Fruity {
 			}
 		}
 
+		public async string resolve_id_from_path (string path, Cancellable? cancellable = null)
+				throws InstallationProxyError, IOError {
+			try {
+				string? result = null;
+
+				var request = make_request ("Lookup");
+
+				var options = new PlistDict ();
+				var attributes = new PlistArray ();
+				options.set_array ("ReturnAttributes", attributes);
+				attributes.add_string ("Path");
+
+				var reader = yield service.begin_query (request, cancellable);
+				string status = "";
+				do {
+					var response = yield reader.read (cancellable);
+
+					var result_dict = response.get_dict ("LookupResult");
+					if (result == null) {
+						foreach (var identifier in result_dict.keys) {
+							unowned string app_path = result_dict.get_dict (identifier).get_string ("Path");
+							if (app_path == path) {
+								result = identifier;
+								break;
+							}
+						}
+					}
+
+					status = response.get_string ("Status");
+				} while (status != "Complete");
+
+				if (result == null)
+					throw new InstallationProxyError.INVALID_ARGUMENT ("Specified path does not match any app");
+
+				return result;
+			} catch (PlistServiceError e) {
+				throw error_from_service (e);
+			} catch (PlistError e) {
+				throw error_from_plist (e);
+			}
+		}
+
 		private static Plist make_request (string command) {
 			var request = new Plist ();
 			request.set_string ("Command", command);
@@ -125,11 +169,11 @@ namespace Frida.Fruity {
 		}
 
 		private static ApplicationDetails parse_application_details (PlistDict details) throws PlistError {
-			string identifier = details.get_string ("CFBundleIdentifier");
-			string name = details.get_string ("CFBundleDisplayName");
+			unowned string identifier = details.get_string ("CFBundleIdentifier");
+			unowned string name = details.get_string ("CFBundleDisplayName");
 
-			string path = details.get_string ("Path");
-			string? container = details.has ("Container") ? details.get_string ("Container") : null;
+			unowned string path = details.get_string ("Path");
+			unowned string? container = details.has ("Container") ? details.get_string ("Container") : null;
 
 			bool debuggable = false;
 			if (details.has ("Entitlements")) {
@@ -160,6 +204,7 @@ namespace Frida.Fruity {
 	}
 
 	public errordomain InstallationProxyError {
+		INVALID_ARGUMENT,
 		PROTOCOL
 	}
 
