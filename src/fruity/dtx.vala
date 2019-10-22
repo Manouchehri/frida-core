@@ -152,6 +152,13 @@ namespace Frida.Fruity {
 			var control_channel = new DTXChannel (CONTROL_CHANNEL_CODE, this);
 			channels[CONTROL_CHANNEL_CODE] = control_channel;
 
+			var capabilities = new NSDictionary ();
+			capabilities.set_int64 ("com.apple.private.DTXConnection", 1);
+			capabilities.set_int64 ("com.apple.private.DTXBlockCompression", 2);
+			var args = new DTXArgumentListBuilder ()
+				.append_object (capabilities);
+			control_channel.invoke_without_reply ("_notifyOfPublishedCapabilities:", args);
+
 			process_incoming_fragments.begin ();
 		}
 
@@ -174,6 +181,7 @@ namespace Frida.Fruity {
 				.append_string (identifier);
 			try {
 				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
+				printerr ("w00t!\n");
 			} catch (GLib.Error e) {
 				printerr ("Oopsie: %s\n", e.message);
 				channels.unset (channel.code);
@@ -500,7 +508,7 @@ namespace Frida.Fruity {
 
 			uint32 identifier;
 			transport.send_message (message, out identifier);
-			printerr ("[DTXChannel %d] invoked %s, identifier=%u\n", code, method_name, identifier);
+			printerr ("[DTXChannel %d] invoke() %s, identifier=%u\n", code, method_name, identifier);
 
 			var request = new Promise<NSObject?> ();
 			pending_responses[identifier] = request;
@@ -510,6 +518,23 @@ namespace Frida.Fruity {
 			} finally {
 				pending_responses.unset (identifier);
 			}
+		}
+
+		public void invoke_without_reply (string method_name, DTXArgumentListBuilder args) {
+			var message = DTXMessage ();
+			message.type = INVOKE;
+			message.channel_code = code;
+			message.transport_flags = NONE;
+
+			var aux_data = args.build ();
+			message.aux_data = aux_data.get_data ();
+
+			var payload_data = NSKeyedArchive.encode (new NSString (method_name));
+			message.payload_data = payload_data;
+
+			uint32 identifier;
+			transport.send_message (message, out identifier);
+			printerr ("[DTXChannel %d] invoke_without_reply() %s\n", code, method_name);
 		}
 
 		internal void handle_invoke (DTXMessage message) throws Error {
@@ -600,6 +625,7 @@ namespace Frida.Fruity {
 
 	[Flags]
 	public enum DTXMessageTransportFlags {
+		NONE          = 0,
 		EXPECTS_REPLY = (1 << 0),
 	}
 
@@ -788,6 +814,12 @@ namespace Frida.Fruity {
 			}
 		}
 
+		public Gee.Set<Gee.Map.Entry<NSObject, NSObject>> entries {
+			owned get {
+				return storage.entries;
+			}
+		}
+
 		public Gee.Iterable<NSObject> keys {
 			owned get {
 				return storage.keys;
@@ -802,8 +834,8 @@ namespace Frida.Fruity {
 
 		private Gee.HashMap<NSObject, NSObject> storage;
 
-		public NSDictionary (Gee.HashMap<NSObject, NSObject> storage) {
-			this.storage = storage;
+		public NSDictionary (Gee.HashMap<NSObject, NSObject>? storage = null) {
+			this.storage = (storage != null) ? storage : new Gee.HashMap<NSObject, NSObject> ();
 		}
 
 		public string get_string (string key) throws Error {
@@ -829,6 +861,10 @@ namespace Frida.Fruity {
 
 			val = str_obj.str;
 			return true;
+		}
+
+		public void set_int64 (string key, int64 val) {
+			storage[new NSString (key)] = new NSNumber (val);
 		}
 	}
 
@@ -859,14 +895,13 @@ namespace Frida.Fruity {
 		private Gee.HashMap<Type, EncodeFunc> encoders;
 		private Gee.HashMap<string, DecodeFunc> decoders;
 
-		[CCode (has_target = false)]
-		private delegate PlistUid EncodeFunc (NSObject instance, PlistArray objects);
+		private const string[] DICTIONARY_CLASS = { "NSDictionary", "NSObject" };
 
 		[CCode (has_target = false)]
-		private delegate NSObject DecodeFunc (PlistDict instance, PlistArray objects) throws Error, PlistError;
+		private delegate PlistUid EncodeFunc (NSObject instance, EncodingContext ctx);
 
-		private static bool incoming_written = false;
-		private static bool outgoing_written = false;
+		[CCode (has_target = false)]
+		private delegate NSObject DecodeFunc (PlistDict instance, DecodingContext ctx) throws Error, PlistError;
 
 		private static uint8[] encode (NSObject? obj) {
 			if (obj == null)
@@ -877,8 +912,10 @@ namespace Frida.Fruity {
 			var objects = new PlistArray ();
 			objects.add_string ("$null");
 
+			var ctx = new EncodingContext (objects);
+
 			var top = new PlistDict ();
-			top.set_uid ("root", encode_value (obj, objects));
+			top.set_uid ("root", encode_value (obj, ctx));
 
 			var plist = new Plist ();
 			plist.set_integer ("$version", 100000);
@@ -886,18 +923,10 @@ namespace Frida.Fruity {
 			plist.set_string ("$archiver", "NSKeyedArchiver");
 			plist.set_dict ("$top", top);
 
-			var data = plist.to_binary ();
-
-			if (!outgoing_written) {
-				printerr ("encode: %s\n", plist.to_xml ());
-				FileUtils.set_data ("/Users/oleavr/VMShared/outgoing.plist", data);
-				outgoing_written = true;
-			}
-
-			return data;
+			return plist.to_binary ();
 		}
 
-		private static PlistUid encode_value (NSObject? obj, PlistArray objects) {
+		private static PlistUid encode_value (NSObject? obj, EncodingContext ctx) {
 			if (obj == null)
 				return new PlistUid (0);
 
@@ -906,7 +935,7 @@ namespace Frida.Fruity {
 			if (encode_object == null)
 				critical ("Missing NSKeyedArchive encoder for type “%s”", type.name ());
 
-			return encode_object (obj, objects);
+			return encode_object (obj, ctx);
 		}
 
 		private static NSObject? decode (uint8[] data) throws Error {
@@ -915,22 +944,20 @@ namespace Frida.Fruity {
 			try {
 				var plist = new Plist.from_binary (data);
 
-				if (!incoming_written) {
-					printerr ("decode: %s\n", plist.to_xml ());
-					FileUtils.set_data ("/Users/oleavr/VMShared/incoming.plist", data);
-					incoming_written = true;
-				}
+				var ctx = new DecodingContext (plist.get_array ("$objects"));
 
-				return decode_value (plist.get_dict ("$top").get_uid ("root"), plist.get_array ("$objects"));
+				return decode_value (plist.get_dict ("$top").get_uid ("root"), ctx);
 			} catch (PlistError e) {
 				throw new Error.PROTOCOL ("%s", e.message);
 			}
 		}
 
-		private static NSObject? decode_value (PlistUid index, PlistArray objects) throws Error, PlistError {
+		private static NSObject? decode_value (PlistUid index, DecodingContext ctx) throws Error, PlistError {
 			var uid = index.uid;
 			if (uid == 0)
 				return null;
+
+			var objects = ctx.objects;
 
 			Value * val = objects.get_value ((int) uid);
 			Type t = val.type ();
@@ -942,10 +969,10 @@ namespace Frida.Fruity {
 				return new NSString (val.get_string ());
 
 			if (t == typeof (PlistDict)) {
-				var instance = val.get_object () as PlistDict;
+				var instance = (PlistDict) val.get_object ();
 				var klass = objects.get_dict ((int) instance.get_uid ("$class").uid);
 				var decode = get_decoder (klass);
-				return decode (instance, objects);
+				return decode (instance, ctx);
 			}
 
 			throw new Error.NOT_SUPPORTED ("Unsupported NSKeyedArchive type: %s", val.type_name ());
@@ -970,7 +997,9 @@ namespace Frida.Fruity {
 				return;
 
 			encoders = new Gee.HashMap<Type, EncodeFunc> ();
+			encoders[typeof (NSNumber)] = encode_number;
 			encoders[typeof (NSString)] = encode_string;
+			encoders[typeof (NSDictionary)] = encode_dictionary;
 		}
 
 		private static void ensure_decoders_registered () {
@@ -982,30 +1011,55 @@ namespace Frida.Fruity {
 			decoders["NSError"] = decode_error;
 		}
 
-		private static PlistUid encode_string (NSObject instance, PlistArray objects) {
-			string str = (instance as NSString).str;
+		private static PlistUid encode_number (NSObject instance, EncodingContext ctx) {
+			int64 val = ((NSNumber) instance).val;
 
-			var uid = find_existing_object (objects, e => e.holds (typeof (string)) && e.get_string () == str);
+			var uid = ctx.find_existing_object (e => e.holds (typeof (int64)) && e.get_int64 () == val);
 			if (uid != null)
 				return uid;
 
+			var objects = ctx.objects;
+			uid = new PlistUid (objects.length);
+			objects.add_integer (val);
+			return uid;
+		}
+
+		private static PlistUid encode_string (NSObject instance, EncodingContext ctx) {
+			string str = ((NSString) instance).str;
+
+			var uid = ctx.find_existing_object (e => e.holds (typeof (string)) && e.get_string () == str);
+			if (uid != null)
+				return uid;
+
+			var objects = ctx.objects;
 			uid = new PlistUid (objects.length);
 			objects.add_string (str);
 			return uid;
 		}
 
-		private static PlistUid? find_existing_object (PlistArray objects, Gee.Predicate<Value *> predicate) {
-			int64 uid = 0;
-			foreach (var e in objects.elements) {
-				if (uid > 0 && predicate (e))
-					return new PlistUid (uid);
-				uid++;
-			}
+		private static PlistUid encode_dictionary (NSObject instance, EncodingContext ctx) {
+			NSDictionary dict = (NSDictionary) instance;
 
-			return null;
+			var object = new PlistDict ();
+			var uid = ctx.add_object (object);
+
+			var keys = new PlistArray ();
+			var objs = new PlistArray ();
+			foreach (var entry in dict.entries) {
+				var key = encode_value (entry.key, ctx);
+				var obj = encode_value (entry.value, ctx);
+
+				keys.add_uid (key);
+				objs.add_uid (obj);
+			}
+			object.set_array ("NS.keys", keys);
+			object.set_array ("NS.objects", objs);
+			object.set_uid ("$class", ctx.get_class (DICTIONARY_CLASS));
+
+			return uid;
 		}
 
-		private static NSObject decode_dictionary (PlistDict instance, PlistArray objects) throws Error, PlistError {
+		private static NSObject decode_dictionary (PlistDict instance, DecodingContext ctx) throws Error, PlistError {
 			var keys = instance.get_array ("NS.keys");
 			var objs = instance.get_array ("NS.objects");
 
@@ -1013,8 +1067,8 @@ namespace Frida.Fruity {
 
 			var n = keys.length;
 			for (int i = 0; i != n; i++) {
-				var key = decode_value (keys.get_uid (i), objects);
-				var obj = decode_value (objs.get_uid (i), objects);
+				var key = decode_value (keys.get_uid (i), ctx);
+				var obj = decode_value (objs.get_uid (i), ctx);
 
 				storage[key] = obj;
 			}
@@ -1022,18 +1076,77 @@ namespace Frida.Fruity {
 			return new NSDictionary (storage);
 		}
 
-		private static NSObject decode_error (PlistDict instance, PlistArray objects) throws Error, PlistError {
-			NSString? domain = decode_value (instance.get_uid ("NSDomain"), objects) as NSString;
+		private static NSObject decode_error (PlistDict instance, DecodingContext ctx) throws Error, PlistError {
+			NSString? domain = decode_value (instance.get_uid ("NSDomain"), ctx) as NSString;
 			if (domain == null)
 				throw new Error.PROTOCOL ("Malformed NSError");
 
 			int64 code = instance.get_integer ("NSCode");
 
-			NSObject? user_info = decode_value (instance.get_uid ("NSUserInfo"), objects);
+			NSObject? user_info = decode_value (instance.get_uid ("NSUserInfo"), ctx);
 			if (user_info != null && !(user_info is NSDictionary))
 				throw new Error.PROTOCOL ("Malformed NSError");
 
 			return new NSError (domain, code, (NSDictionary) user_info);
+		}
+
+		private class EncodingContext {
+			public PlistArray objects;
+
+			private Gee.HashMap<string, PlistUid> classes = new Gee.HashMap<string, PlistUid> ();
+
+			public delegate void AddObjectFunc (PlistArray objects);
+
+			public EncodingContext (PlistArray objects) {
+				this.objects = objects;
+			}
+
+			public PlistUid? find_existing_object (Gee.Predicate<Value *> predicate) {
+				int64 uid = 0;
+				foreach (var e in objects.elements) {
+					if (uid > 0 && predicate (e))
+						return new PlistUid (uid);
+					uid++;
+				}
+
+				return null;
+			}
+
+			public PlistUid add_object (PlistDict obj) {
+				var uid = new PlistUid (objects.length);
+				objects.add_dict (obj);
+				return uid;
+			}
+
+			public PlistUid get_class (string[] description) {
+				var canonical_name = description[0];
+
+				var uid = classes[canonical_name];
+				if (uid != null)
+					return uid;
+
+				var spec = new PlistDict ();
+
+				var hierarchy = new PlistArray ();
+				foreach (var name in description)
+					hierarchy.add_string (name);
+				spec.set_array ("$classes", hierarchy);
+
+				spec.set_string ("$classname", canonical_name);
+
+				uid = add_object (spec);
+				classes[canonical_name] = uid;
+
+				return uid;
+			}
+		}
+
+		private class DecodingContext {
+			public PlistArray objects;
+
+			public DecodingContext (PlistArray objects) {
+				this.objects = objects;
+			}
 		}
 	}
 
