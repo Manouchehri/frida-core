@@ -282,6 +282,7 @@ fruity_sources = [
   'fruity/lldb.vala',
   'fruity/injector.vala',
   'fruity/usbmux.vala',
+  'fruity/keyed-archive.vala',
   'fruity/plist.vala',
   'fruity/plist-service.vala',
 ]
