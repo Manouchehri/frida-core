@@ -117,7 +117,8 @@ namespace Frida.Fruity {
 		private size_t total_buffered = 0;
 		private Gee.ArrayQueue<Bytes> pending_writes = new Gee.ArrayQueue<Bytes> ();
 
-		private Gee.HashMap<uint32, DTXChannel> channels = new Gee.HashMap<uint32, DTXChannel> ();
+		private DTXControlChannel control_channel;
+		private Gee.HashMap<uint32, unowned DTXChannel> channels = new Gee.HashMap<uint32, unowned DTXChannel> ();
 		private int32 next_channel_code = 1;
 
 		private const uint32 DTX_FRAGMENT_MAGIC = 0x1f3d5b79U;
@@ -125,8 +126,6 @@ namespace Frida.Fruity {
 		private const size_t MAX_BUFFERED_SIZE = 30 * 1024 * 1024;
 		private const size_t MAX_MESSAGE_SIZE = 1024 * 1024;
 		private const size_t MAX_FRAGMENT_SIZE = 128 * 1024;
-
-		private const int32 CONTROL_CHANNEL_CODE = 0;
 
 		public static async DTXConnection obtain (ChannelProvider channel_provider, Cancellable? cancellable)
 				throws Error, IOError {
@@ -173,10 +172,10 @@ namespace Frida.Fruity {
 			input.byte_order = LITTLE_ENDIAN;
 			output = stream.get_output_stream ();
 
-			var control_channel = new DTXChannel (CONTROL_CHANNEL_CODE, this);
-			channels[CONTROL_CHANNEL_CODE] = control_channel;
+			control_channel = new DTXControlChannel (this);
+			channels[control_channel.code] = control_channel;
 
-			send_capabilities ();
+			control_channel.notify_of_published_capabilities ();
 
 			process_incoming_fragments.begin ();
 		}
@@ -187,31 +186,21 @@ namespace Frida.Fruity {
 			var channel = new DTXChannel (channel_code, this);
 			channels[channel_code] = channel;
 
-			request_channel.begin (channel, identifier);
+			establish_channel.begin (channel, identifier);
 
 			return channel;
 		}
 
-		private void send_capabilities () {
-			var control_channel = channels[CONTROL_CHANNEL_CODE];
+		private void remove_channel (DTXChannel channel) {
+			channels.unset (channel.code);
 
-			var capabilities = new NSDictionary ();
-			capabilities.set_value ("com.apple.private.DTXConnection", new NSNumber.from_integer (1));
-			capabilities.set_value ("com.apple.private.DTXBlockCompression", new NSNumber.from_integer (2));
-
-			var args = new DTXArgumentListBuilder ()
-				.append_object (capabilities);
-			control_channel.invoke_without_reply ("_notifyOfPublishedCapabilities:", args);
+			if (channel != control_channel)
+				control_channel.cancel_channel.begin (channel.code, io_cancellable);
 		}
 
-		private async void request_channel (DTXChannel channel, string identifier) {
-			var control_channel = channels[CONTROL_CHANNEL_CODE];
-
-			var args = new DTXArgumentListBuilder ()
-				.append_int32 (channel.code)
-				.append_object (new NSString (identifier));
+		private async void establish_channel (DTXChannel channel, string identifier) {
 			try {
-				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
+				yield control_channel.request_channel (channel.code, identifier, io_cancellable);
 			} catch (GLib.Error e) {
 				channels.unset (channel.code);
 			}
@@ -496,6 +485,35 @@ namespace Frida.Fruity {
 		}
 	}
 
+	private class DTXControlChannel : DTXChannel {
+		public DTXControlChannel (DTXTransport transport) {
+			Object (code: 0, transport: transport);
+		}
+
+		public void notify_of_published_capabilities () {
+			var capabilities = new NSDictionary ();
+			capabilities.set_value ("com.apple.private.DTXConnection", new NSNumber.from_integer (1));
+			capabilities.set_value ("com.apple.private.DTXBlockCompression", new NSNumber.from_integer (2));
+
+			var args = new DTXArgumentListBuilder ()
+				.append_object (capabilities);
+			invoke_without_reply ("_notifyOfPublishedCapabilities:", args);
+		}
+
+		public async void request_channel (int32 code, string identifier, Cancellable? cancellable) throws Error, IOError {
+			var args = new DTXArgumentListBuilder ()
+				.append_int32 (code)
+				.append_object (new NSString (identifier));
+			yield invoke ("_requestChannelWithCode:identifier:", args, cancellable);
+		}
+
+		public async void cancel_channel (int32 code, Cancellable? cancellable) throws Error, IOError {
+			var args = new DTXArgumentListBuilder ()
+				.append_int32 (code);
+			yield invoke ("_channelCanceled:", args, cancellable);
+		}
+	}
+
 	public class DTXChannel : Object {
 		public signal void invocation (string method_name, DTXArgumentList args, DTXMessageTransportFlags transport_flags);
 		public signal void notification (NSDictionary dict);
@@ -515,6 +533,12 @@ namespace Frida.Fruity {
 
 		public DTXChannel (int32 code, DTXTransport transport) {
 			Object (code: code, transport: transport);
+		}
+
+		public override void dispose () {
+			transport.remove_channel (this);
+
+			base.dispose ();
 		}
 
 		public async void close (Cancellable? cancellable = null) throws IOError {
@@ -630,6 +654,7 @@ namespace Frida.Fruity {
 
 	public interface DTXTransport : Object {
 		public abstract void send_message (DTXMessage message, out uint32 identifier);
+		public abstract void remove_channel (DTXChannel channel);
 	}
 
 	public enum DTXMessageType {
