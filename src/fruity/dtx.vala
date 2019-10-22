@@ -178,7 +178,7 @@ namespace Frida.Fruity {
 
 			var args = new DTXArgumentListBuilder ()
 				.append_int32 (channel.code)
-				.append_string (identifier);
+				.append_object (new NSString (identifier));
 			try {
 				yield control_channel.invoke ("_requestChannelWithCode:identifier:", args, io_cancellable);
 				printerr ("w00t!\n");
