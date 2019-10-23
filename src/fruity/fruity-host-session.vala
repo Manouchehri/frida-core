@@ -429,12 +429,7 @@ namespace Frida {
 			if (process == null)
 				return HostApplicationInfo ("", "", 0, no_icon, no_icon);
 
-			string app_path = process.real_app_name;
-			if (app_path.has_prefix ("/var/containers"))
-				app_path = "/private" + app_path;
-			int dot_app_start = app_path.last_index_of (".app/");
-			if (dot_app_start != -1)
-				app_path = app_path[0:dot_app_start + 4];
+			string app_path = compute_app_path_from_executable_path (process.real_app_name);
 
 			var lockdown = yield lockdown_provider.get_lockdown_client (cancellable);
 
@@ -462,18 +457,22 @@ namespace Frida {
 
 			try {
 				var lockdown = yield lockdown_provider.get_lockdown_client (cancellable);
-
 				var installation_proxy = yield Fruity.InstallationProxyClient.open (lockdown, cancellable);
-
 				var apps = yield installation_proxy.browse (cancellable);
 
-				uint no_pid = 0;
+				var pids = new Gee.HashMap<string, uint> ();
+				var device_info = yield Fruity.DeviceInfoService.open (channel_provider, cancellable);
+				var processes = yield device_info.enumerate_processes (cancellable);
+				foreach (var process in processes)
+					pids[compute_app_path_from_executable_path (process.real_app_name)] = process.pid;
+
 				var no_icon = ImageData (0, 0, 0, "");
 
 				var result = new HostApplicationInfo[apps.size];
 				int i = 0;
 				foreach (var app in apps) {
-					result[i] = HostApplicationInfo (app.identifier, app.name, no_pid, no_icon, no_icon);
+					uint pid = pids[app.path];
+					result[i] = HostApplicationInfo (app.identifier, app.name, pid, no_icon, no_icon);
 					i++;
 				}
 
@@ -489,6 +488,18 @@ namespace Frida {
 			} catch (Fruity.InstallationProxyError e) {
 				throw new Error.NOT_SUPPORTED ("%s", e.message);
 			}
+		}
+
+		private static string compute_app_path_from_executable_path (string executable_path) {
+			string app_path = executable_path;
+			if (app_path.has_prefix ("/var/containers"))
+				app_path = "/private" + app_path;
+
+			int dot_app_start = app_path.last_index_of (".app/");
+			if (dot_app_start != -1)
+				app_path = app_path[0:dot_app_start + 4];
+
+			return app_path;
 		}
 
 		public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws Error, IOError {
