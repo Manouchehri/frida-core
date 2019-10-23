@@ -455,38 +455,68 @@ namespace Frida {
 				}
 			}
 
+			var apps_request = new Promise<Gee.ArrayList<Fruity.ApplicationDetails>> ();
+			fetch_apps.begin (apps_request, cancellable);
+
+			var pids_request = new Promise<Gee.HashMap<string, uint>> ();
+			fetch_pids.begin (pids_request, cancellable);
+
+			var apps = yield apps_request.future.wait_async (cancellable);
+			var pids = yield pids_request.future.wait_async (cancellable);
+
+			var no_icon = ImageData (0, 0, 0, "");
+
+			var result = new HostApplicationInfo[apps.size];
+			int i = 0;
+			foreach (var app in apps) {
+				uint pid = pids[app.path];
+				result[i] = HostApplicationInfo (app.identifier, app.name, pid, no_icon, no_icon);
+				i++;
+			}
+
+			if (server != null && server.flavor == GADGET) {
+				try {
+					foreach (var app in yield server.session.enumerate_applications (cancellable))
+						result += app;
+				} catch (GLib.Error e) {
+				}
+			}
+
+			return result;
+		}
+
+		private async void fetch_apps (Promise<Gee.ArrayList<Fruity.ApplicationDetails>> promise, Cancellable? cancellable) {
 			try {
 				var lockdown = yield lockdown_provider.get_lockdown_client (cancellable);
 				var installation_proxy = yield Fruity.InstallationProxyClient.open (lockdown, cancellable);
+
 				var apps = yield installation_proxy.browse (cancellable);
 
-				var pids = new Gee.HashMap<string, uint> ();
+				promise.resolve (apps);
+			} catch (Error e) {
+				promise.reject (e);
+			} catch (IOError e) {
+				promise.reject (e);
+			} catch (Fruity.InstallationProxyError e) {
+				promise.reject (new Error.NOT_SUPPORTED ("%s", e.message));
+			}
+		}
+
+		private async void fetch_pids (Promise<Gee.HashMap<string, uint>> promise, Cancellable? cancellable) {
+			try {
 				var device_info = yield Fruity.DeviceInfoService.open (channel_provider, cancellable);
+
 				var processes = yield device_info.enumerate_processes (cancellable);
+
+				var pids = new Gee.HashMap<string, uint> ();
 				foreach (var process in processes)
 					pids[compute_app_path_from_executable_path (process.real_app_name)] = process.pid;
 
-				var no_icon = ImageData (0, 0, 0, "");
-
-				var result = new HostApplicationInfo[apps.size];
-				int i = 0;
-				foreach (var app in apps) {
-					uint pid = pids[app.path];
-					result[i] = HostApplicationInfo (app.identifier, app.name, pid, no_icon, no_icon);
-					i++;
-				}
-
-				if (server != null && server.flavor == GADGET) {
-					try {
-						foreach (var app in yield server.session.enumerate_applications (cancellable))
-							result += app;
-					} catch (GLib.Error e) {
-					}
-				}
-
-				return result;
-			} catch (Fruity.InstallationProxyError e) {
-				throw new Error.NOT_SUPPORTED ("%s", e.message);
+				promise.resolve (pids);
+			} catch (Error e) {
+				promise.reject (e);
+			} catch (IOError e) {
+				promise.reject (e);
 			}
 		}
 
