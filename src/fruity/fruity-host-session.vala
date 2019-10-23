@@ -352,7 +352,7 @@ namespace Frida {
 			construct;
 		}
 
-		private Gee.HashMap<uint, SpawnEntry> spawn_entries = new Gee.HashMap<uint, SpawnEntry> ();
+		private Gee.HashMap<uint, LLDBSession> lldb_sessions = new Gee.HashMap<uint, LLDBSession> ();
 		private Gee.HashMap<AgentSessionId?, AgentEntry> agent_entries =
 			new Gee.HashMap<AgentSessionId?, AgentEntry> (AgentSessionId.hash, AgentSessionId.equal);
 
@@ -399,11 +399,11 @@ namespace Frida {
 				yield entry.close (cancellable);
 			}
 
-			while (!spawn_entries.is_empty) {
-				var iterator = spawn_entries.values.iterator ();
+			while (!lldb_sessions.is_empty) {
+				var iterator = lldb_sessions.values.iterator ();
 				iterator.next ();
-				var entry = iterator.get ();
-				yield entry.close (cancellable);
+				var session = iterator.get ();
+				yield session.close (cancellable);
 			}
 
 			io_cancellable.cancel ();
@@ -644,14 +644,10 @@ namespace Frida {
 					process = yield lldb.launch (argv, launch_options, cancellable);
 				}
 
-				var pid = process.pid;
+				var session = new LLDBSession (lldb, process, gadget_path, channel_provider);
+				add_lldb_session (session);
 
-				var entry = new SpawnEntry (lldb, process, gadget_path, channel_provider);
-				entry.closed.connect (on_spawn_entry_closed);
-				entry.output.connect (on_spawn_entry_output);
-				spawn_entries[pid] = entry;
-
-				return pid;
+				return process.pid;
 			} catch (Fruity.InstallationProxyError e) {
 				throw new Error.NOT_SUPPORTED ("%s", e.message);
 			} catch (Fruity.LockdownError e) {
@@ -673,9 +669,9 @@ namespace Frida {
 		}
 
 		public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
-			var entry = spawn_entries[pid];
-			if (entry != null) {
-				yield entry.resume (cancellable);
+			var session = lldb_sessions[pid];
+			if (session != null) {
+				yield session.resume (cancellable);
 				return;
 			}
 
@@ -688,9 +684,9 @@ namespace Frida {
 		}
 
 		public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
-			var spawn_entry = spawn_entries[pid];
-			if (spawn_entry != null) {
-				yield spawn_entry.kill (cancellable);
+			var lldb_session = lldb_sessions[pid];
+			if (lldb_session != null) {
+				yield lldb_session.kill (cancellable);
 				return;
 			}
 
@@ -703,39 +699,77 @@ namespace Frida {
 		}
 
 		public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {
-			var spawn_entry = spawn_entries[pid];
-			if (spawn_entry != null) {
-				var gadget_details = yield spawn_entry.query_gadget_details (cancellable);
+			var lldb_session = lldb_sessions[pid];
+			if (lldb_session != null) {
+				var gadget_details = yield lldb_session.query_gadget_details (cancellable);
 
+				return yield attach_via_gadget (pid, gadget_details, cancellable);
+			}
+
+			var server = yield try_get_remote_server (cancellable);
+			if (server != null) {
 				try {
-					var stream = yield channel_provider.open_channel (
-						("tcp:%" + uint16.FORMAT_MODIFIER + "u").printf (gadget_details.port),
-						cancellable);
-
-					var connection = yield new DBusConnection (stream, null, AUTHENTICATION_CLIENT, null, cancellable);
-
-					HostSession host_session = yield connection.get_proxy (null, ObjectPath.HOST_SESSION,
-						DBusProxyFlags.NONE, cancellable);
-
-					AgentSessionId remote_session_id = yield host_session.attach_to (pid, cancellable);
-
-					AgentSession agent_session = yield connection.get_proxy (null,
-						ObjectPath.from_agent_session_id (remote_session_id), DBusProxyFlags.NONE, cancellable);
-
-					var local_session_id = AgentSessionId (next_agent_session_id++);
-					var agent_entry = new AgentEntry (local_session_id, agent_session, host_session, connection);
-					agent_entry.detached.connect (on_agent_entry_detached);
-					agent_entries[local_session_id] = agent_entry;
-					agent_sessions[local_session_id] = agent_session;
-
-					return local_session_id;
-				} catch (GLib.Error e) {
-					throw new Error.NOT_SUPPORTED ("%s", e.message);
+					return yield attach_via_remote (pid, server, cancellable);
+				} catch (Error e) {
+					if (server.flavor == REGULAR)
+						throw_api_error (e);
 				}
 			}
 
-			var server = yield get_remote_server (cancellable);
+			try {
+				var lockdown = yield lockdown_provider.get_lockdown_client (cancellable);
+				var lldb_stream = yield lockdown.start_service (DEBUGSERVER_SERVICE_NAME, cancellable);
+				var lldb = yield LLDB.Client.open (lldb_stream, cancellable);
+				var process = yield lldb.attach_by_pid (pid, cancellable);
 
+				string? gadget_path = null;
+
+				lldb_session = new LLDBSession (lldb, process, gadget_path, channel_provider);
+				add_lldb_session (lldb_session);
+			} catch (Fruity.LockdownError e) {
+				if (e is Fruity.LockdownError.INVALID_SERVICE)
+					throw new Error.NOT_SUPPORTED ("A Developer Disk Image is not mounted");
+				throw new Error.NOT_SUPPORTED ("%s", e.message);
+			} catch (LLDB.Error e) {
+				throw new Error.NOT_SUPPORTED ("%s", e.message);
+			}
+
+			var gadget_details = yield lldb_session.query_gadget_details (cancellable);
+
+			return yield attach_via_gadget (pid, gadget_details, cancellable);
+		}
+
+		private async AgentSessionId attach_via_gadget (uint pid, Fruity.Injector.GadgetDetails gadget_details,
+				Cancellable? cancellable) throws Error, IOError {
+			try {
+				var stream = yield channel_provider.open_channel (
+					("tcp:%" + uint16.FORMAT_MODIFIER + "u").printf (gadget_details.port),
+					cancellable);
+
+				var connection = yield new DBusConnection (stream, null, AUTHENTICATION_CLIENT, null, cancellable);
+
+				HostSession host_session = yield connection.get_proxy (null, ObjectPath.HOST_SESSION,
+					DBusProxyFlags.NONE, cancellable);
+
+				AgentSessionId remote_session_id = yield host_session.attach_to (pid, cancellable);
+
+				AgentSession agent_session = yield connection.get_proxy (null,
+					ObjectPath.from_agent_session_id (remote_session_id), DBusProxyFlags.NONE, cancellable);
+
+				var local_session_id = AgentSessionId (next_agent_session_id++);
+				var agent_entry = new AgentEntry (local_session_id, agent_session, host_session, connection);
+				agent_entry.detached.connect (on_agent_entry_detached);
+				agent_entries[local_session_id] = agent_entry;
+				agent_sessions[local_session_id] = agent_session;
+
+				return local_session_id;
+			} catch (GLib.Error e) {
+				throw new Error.NOT_SUPPORTED ("%s", e.message);
+			}
+		}
+
+		private async AgentSessionId attach_via_remote (uint pid, RemoteServer server, Cancellable? cancellable)
+				throws Error, IOError {
 			AgentSessionId remote_session_id;
 			try {
 				remote_session_id = yield server.session.attach_to (pid, cancellable);
@@ -785,15 +819,26 @@ namespace Frida {
 			}
 		}
 
-		private void on_spawn_entry_closed (SpawnEntry entry) {
-			spawn_entries.unset (entry.process.pid);
+		private void add_lldb_session (LLDBSession session) {
+			lldb_sessions[session.process.pid] = session;
 
-			entry.closed.disconnect (on_spawn_entry_closed);
-			entry.output.disconnect (on_spawn_entry_output);
+			session.closed.connect (on_lldb_session_closed);
+			session.output.connect (on_lldb_session_output);
 		}
 
-		private void on_spawn_entry_output (SpawnEntry entry, Bytes bytes) {
-			output (entry.process.pid, 1, bytes.get_data ());
+		private void remove_lldb_session (LLDBSession session) {
+			lldb_sessions.unset (session.process.pid);
+
+			session.closed.disconnect (on_lldb_session_closed);
+			session.output.disconnect (on_lldb_session_output);
+		}
+
+		private void on_lldb_session_closed (LLDBSession session) {
+			remove_lldb_session (session);
+		}
+
+		private void on_lldb_session_output (LLDBSession session, Bytes bytes) {
+			output (session.process.pid, 1, bytes.get_data ());
 		}
 
 		private void on_agent_entry_detached (AgentEntry entry, SessionDetachReason reason) {
@@ -996,7 +1041,7 @@ namespace Frida {
 			uninjected (id);
 		}
 
-		private class SpawnEntry : Object {
+		private class LLDBSession : Object {
 			public signal void closed ();
 			public signal void output (Bytes bytes);
 
@@ -1022,7 +1067,7 @@ namespace Frida {
 
 			private Promise<Fruity.Injector.GadgetDetails>? gadget_request;
 
-			public SpawnEntry (LLDB.Client lldb, LLDB.Process process, string? gadget_path, ChannelProvider channel_provider) {
+			public LLDBSession (LLDB.Client lldb, LLDB.Process process, string? gadget_path, ChannelProvider channel_provider) {
 				Object (
 					lldb: lldb,
 					process: process,
@@ -1036,7 +1081,7 @@ namespace Frida {
 				lldb.console_output.connect (on_lldb_console_output);
 			}
 
-			~SpawnEntry () {
+			~LLDBSession () {
 				lldb.closed.disconnect (on_lldb_closed);
 				lldb.console_output.disconnect (on_lldb_console_output);
 			}
